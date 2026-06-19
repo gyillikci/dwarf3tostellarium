@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Throwaway diagnostic scripts
+_airplane_track_live.py
+_manual_track_live.py
+_sentry_live.py
+_track_diag.py
+_track_locked.py

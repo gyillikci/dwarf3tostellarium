@@ -119,6 +119,7 @@ CMD_CAMERA_WIDE_STOP_RECORD              = 12006
 
 # ── System commands (13000-13299) ─────────────────────────────────────────────
 CMD_SYSTEM_SET_TIME                      = 13000
+CMD_SYSTEM_SET_MASTERLOCK                = 13004  # ReqsetMasterLock{ bool lock = 1 }
 CMD_SYSTEM_SET_LOCATION                  = 13010
 
 # ── RGB/Power commands (13500-13799) ──────────────────────────────────────────
@@ -137,6 +138,15 @@ CMD_STEP_MOTOR_JOYSTICK_STOP             = 14008  # CMD_STEP_MOTOR_SERVICE_JOYST
 # ── Track commands (14800-14899) ──────────────────────────────────────────────
 CMD_TRACK_START_TRACK                    = 14800
 CMD_TRACK_STOP_TRACK                     = 14801
+CMD_SENTRY_MODE_START                    = 14802  # ReqStartSentryMode{ int32 mode=1 }
+CMD_SENTRY_MODE_STOP                     = 14803
+CMD_MOT_START                            = 14804  # Multi-Object Tracking start
+CMD_MOT_TRACK_ONE                        = 14805  # tele: lock one detected id
+CMD_UFOTRACK_MODE_START                  = 14806  # UFO mode (reuses sentry, v1.5+)
+CMD_UFOTRACK_MODE_STOP                   = 14807
+CMD_MOT_WIDE_TRACK_ONE                   = 14808  # wide: lock one detected id
+CMD_WIDE_TELE_TRACK_SWITCH               = 14809  # 30-class detect, wide/tele switch
+CMD_UFO_HAND_AOTO_MODE                   = 14810  # UFO manual(0)/auto(1) select
 
 # ── Focus commands (15000-15199) ──────────────────────────────────────────────
 CMD_FOCUS_AUTO_FOCUS                     = 15000
@@ -155,7 +165,18 @@ CMD_NOTIFY_PROGRASS_CAPTURE_RAW_LIVE_STACKING = 15209
 CMD_NOTIFY_STATE_ASTRO_CALIBRATION       = 15210
 CMD_NOTIFY_STATE_ASTRO_GOTO              = 15211
 CMD_NOTIFY_STATE_ASTRO_TRACKING          = 15212
+CMD_NOTIFY_TRACK_RESULT                  = 15225  # tele single-target box {x,y,w,h}
+CMD_NOTIFY_SENTRY_MODE_STATE             = 15231  # sentinel/UFO state machine code
+CMD_NOTIFY_SENTRY_MODE_TRACK_RESULT      = 15232  # sentinel-mode box {x,y,w,h}
+CMD_NOTIFY_MULTI_TRACK_RESULT            = 15238  # tele multi-box (nested repeated)
+CMD_NOTIFY_UFO_MODE_STATE                = 15240  # sentinel-UFO mode state
+CMD_NOTIFY_WIDE_MULTI_TRACK_RESULT       = 15251  # wide multi-box (nested repeated)
+CMD_NOTIFY_WIDE_TRACK_RESULT             = 15252  # wide single-target box {x,y,w,h}
 CMD_NOTIFY_TEMPERATURE                   = 15243
+
+# Tracker error / status codes (arrive as the packet cmd id, 4.14.2)
+CODE_TRACK_TRACKER_INITING               = 14900  # tracker is initializing
+CODE_TRACK_TRACKER_FAILED                = 14901  # tracker failed to lock
 CMD_NOTIFY_FOCUS_POSITION                = 15257
 CMD_NOTIFY_CMOS_TEMPERATURE              = 15292
 CMD_NOTIFY_WIDE_FOCUS_POSITION           = 15300  # NEW: wide lens focus position
@@ -201,6 +222,37 @@ def _dvarint(buf, pos):
         if not (b & 0x80): break
         s += 7
     return r, pos
+
+def _to_signed(v):
+    """Interpret a decoded protobuf varint as a (sign-extended) signed int."""
+    v &= 0xFFFFFFFFFFFFFFFF
+    if v >= 0x8000000000000000:
+        v -= 0x10000000000000000
+    return v
+
+def _parse_varint_fields(data):
+    """Walk a protobuf message and return {field_number: signed_value} for all
+    varint (wire type 0) fields. Length-delimited / fixed fields are skipped.
+    Used to decode ResNotifyTrackResult {x=1,y=2,w=3,h=4}."""
+    out = {}
+    i, n = 0, len(data)
+    try:
+        while i < n:
+            tag, i = _dvarint(data, i)
+            fn, wt = tag >> 3, tag & 7
+            if wt == 0:
+                v, i = _dvarint(data, i); out[fn] = _to_signed(v)
+            elif wt == 2:
+                ln, i = _dvarint(data, i); i += ln
+            elif wt == 1:
+                i += 8
+            elif wt == 5:
+                i += 4
+            else:
+                break
+    except IndexError:
+        pass
+    return out
 
 # ── Packet builder / parser ───────────────────────────────────────────────────
 def build_ws_packet(cmd, data=b"", device_id=1, client_id=""):
@@ -303,6 +355,9 @@ class DwarfLab:
             "calibrating": False,
             "focus_position": None,
             "last_cmd": None,
+            "track_box": None,      # (x, y, w, h) live tracked box in frame px
+            "track_box_ts": 0.0,    # time.time() of last track-box update
+            "track_box_src": None,  # "tele" | "wide"
         }
 
     def _ws_url(self):
@@ -413,6 +468,18 @@ class DwarfLab:
             try: v, _ = _dvarint(data, 1); self.state["stacking_progress"] = v
             except: pass
 
+        # Live tracking box (the morphing ROI the firmware reports)
+        elif cmd in (CMD_NOTIFY_TRACK_RESULT, CMD_NOTIFY_WIDE_TRACK_RESULT,
+                     CMD_NOTIFY_SENTRY_MODE_TRACK_RESULT):
+            try:
+                f = _parse_varint_fields(data)
+                box = (f.get(1, -100), f.get(2, -100), f.get(3, 0), f.get(4, 0))
+                self.state["track_box"] = box
+                self.state["track_box_ts"] = time.time()
+                self.state["track_box_src"] = (
+                    "wide" if cmd == CMD_NOTIFY_WIDE_TRACK_RESULT else "tele")
+            except: pass
+
         if self.on_notify: self.on_notify(pkt)
 
     def _on_error(self, ws, e):
@@ -521,7 +588,22 @@ class DwarfLab:
     def one_click_shoot(self):       self.send(CMD_ASTRO_START_ONE_CLICK_SHOOTING)
 
     # ── Focus controls ────────────────────────────────────────────────────────
-    def auto_focus(self):            self.send(CMD_FOCUS_AUTO_FOCUS)
+    def auto_focus(self, center_x=None, center_y=None):
+        """
+        CMD_FOCUS_AUTO_FOCUS (15000) — normal-mode autofocus.
+        ReqNormalAutoFocus { uint32 mode=1; uint32 center_x=2; uint32 center_y=3 }
+        mode 0 = global focus, mode 1 = area focus around (center_x, center_y) in
+        the active camera's preview pixel coordinates. Pass a centre to focus on a
+        specific region of the currently selected feed; omit it for global focus.
+        NOTE: the DWARF 3 has a single motorised focuser on the TELEPHOTO optics;
+        the wide-angle lens is fixed-focus, so focus only physically moves the tele.
+        """
+        if center_x is None or center_y is None:
+            return self.send(CMD_FOCUS_AUTO_FOCUS, _field(1, 0, 0))
+        data = (_field(1, 0, 1) +
+                _field(2, 0, int(center_x)) +
+                _field(3, 0, int(center_y)))
+        return self.send(CMD_FOCUS_AUTO_FOCUS, data)
     def focus_step(self, s=1):       self.send(CMD_FOCUS_MANUAL_SINGLE_STEP, p_int(s))
     def focus_in(self):              self.send(CMD_FOCUS_START_MANUAL_CONTINUOUS, p_int(-1))
     def focus_out(self):             self.send(CMD_FOCUS_START_MANUAL_CONTINUOUS, p_int(1))
@@ -544,6 +626,53 @@ class DwarfLab:
     # ── Tracking ──────────────────────────────────────────────────────────────
     def start_tracking(self):        self.send(CMD_TRACK_START_TRACK)
     def stop_tracking(self):         self.send(CMD_TRACK_STOP_TRACK)
+
+    def start_track_roi(self, x, y, w, h):
+        """
+        CMD_TRACK_START_TRACK (14800) with a manual ROI.
+        ReqStartTrack { int32 x=1; int32 y=2; int32 w=3; int32 h=4 } in *frame
+        pixel* coordinates. The device locks onto a distinct moving object inside
+        the box and drives the motors to keep it centred.
+        """
+        x, y, w, h = int(x), int(y), int(w), int(h)
+        data = (_field(1, 0, x) + _field(2, 0, y) +
+                _field(3, 0, w) + _field(4, 0, h))
+        return self.send(CMD_TRACK_START_TRACK, data)
+
+    def set_master_lock(self, lock=True):
+        """
+        CMD_SYSTEM_SET_MASTERLOCK (13004) — acquire/release the host (master)
+        lock. The DWARF 3 firmware silently ignores control commands from a
+        client that does not hold this lock, so this must be acquired before
+        motion/tracking commands take effect. Device replies on 15223
+        (ResNotifyHostSlaveMode); mode=0 + lock=true means HOST acquired.
+        """
+        return self.send(CMD_SYSTEM_SET_MASTERLOCK, _field(1, 0, 1 if lock else 0))
+
+    # ── Sentinel / UFO auto-track modes ───────────────────────────────────────
+    # In these modes the DWARF firmware AUTO-detects moving objects and drives
+    # its OWN motors to follow them (no software loop needed). UFO mode (v1.5+)
+    # reuses the Sentinel message ReqStartSentryMode{ int32 mode = 1 }. The
+    # `mode` int selects the detection profile (bird / airplane / generic UFO).
+    def start_sentry_mode(self, mode=0):
+        """CMD_SENTRY_MODE_START (14802) — Sentinel auto-detect & track."""
+        return self.send(CMD_SENTRY_MODE_START, _field(1, 0, int(mode)))
+
+    def stop_sentry_mode(self):
+        """CMD_SENTRY_MODE_STOP (14803)."""
+        return self.send(CMD_SENTRY_MODE_STOP)
+
+    def start_ufo_mode(self, mode=1):
+        """CMD_UFOTRACK_MODE_START (14806) — UFO/aircraft auto-track."""
+        return self.send(CMD_UFOTRACK_MODE_START, _field(1, 0, int(mode)))
+
+    def stop_ufo_mode(self):
+        """CMD_UFOTRACK_MODE_STOP (14807)."""
+        return self.send(CMD_UFOTRACK_MODE_STOP)
+
+    def set_ufo_hand_auto(self, auto=True):
+        """CMD_UFO_HAND_AOTO_MODE (14810) — UFO manual(0) / automatic(1)."""
+        return self.send(CMD_UFO_HAND_AOTO_MODE, _field(1, 0, 1 if auto else 0))
 
     # ── New device commands (June 2026 APK) ───────────────────────────────────
     def set_auto_cooling(self, enabled=True):
