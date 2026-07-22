@@ -14,3 +14,10 @@ _manual_track_live.py
 _sentry_live.py
 _track_diag.py
 _track_locked.py
+diag_track.py
+mot_explore.py
+query_params.py
+test_grab.py
+
+# Runtime logs
+*.log

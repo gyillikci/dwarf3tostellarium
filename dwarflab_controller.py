@@ -20,7 +20,7 @@ Changelog vs previous version:
     (new APK sends cameraType field; old binning-only payload still accepted)
   - Fixed: CMD_ASTRO_WIDE_GO_LIVE = 11020 (was 11019 — that's STOP_EQ_SOLVING)
 """
-import struct, uuid, threading, time, logging, requests, websocket
+import struct, uuid, threading, time, logging, socket, requests, websocket
 log = logging.getLogger("dwarflab")
 
 # ── Module IDs ────────────────────────────────────────────────────────────────
@@ -148,6 +148,27 @@ CMD_MOT_WIDE_TRACK_ONE                   = 14808  # wide: lock one detected id
 CMD_WIDE_TELE_TRACK_SWITCH               = 14809  # 30-class detect, wide/tele switch
 CMD_UFO_HAND_AOTO_MODE                   = 14810  # UFO manual(0)/auto(1) select
 
+# ── V3 camera bring-up + MOT (authoritative dwarfAlp proto / DWARF API2) ───────
+# CORRECTION: an earlier version of this file WRONGLY labelled cmd 11043 as a
+# "wide AI track start". The authoritative DWARF proto shows 11043 =
+# V3_ASTRO_GET_PRESETS and 11040 = V3_ASTRO_GET_PARAMS — NEITHER is a track
+# command. They appeared next to the box stream only because tracking was already
+# running. DWARF 3 runs V3 firmware; the real subject-tracking pipeline is below.
+CMD_V3_CAMERA_TELE_OPEN_CAMERA           = 10050  # V3ReqOpenTeleCamera {action:1=open}
+CMD_V3_CAMERA_WIDE_OPEN_CAMERA           = 12036  # V3ReqOpenWideCamera {action:0=open,1=close}
+CMD_V3_ASTRO_GET_PARAMS                  = 11040
+CMD_V3_ASTRO_GET_PRESETS                 = 11043  # NOT a track command (was mislabelled)
+CMD_V3_DEVICE_CONFIG_SHOOTING_MODE       = 16403  # {mode_id:1=photo,3=burst,4=video,5=timelapse}
+CMD_V3_DEVICE_CONFIG_MODE_SWITCH         = 16404
+# Real subject-tracking commands live in MODULE_TRACK (already defined above):
+#   14800 CMD_TRACK_START_TRACK   {x,y,w,h}  -> basic correlation tracker
+#                                              (locks only a distinct/MOVING target)
+#   14809 CMD_WIDE_TELE_TRACK_SWITCH         -> enable the 30-class object detector
+#   14804 CMD_MOT_START                       -> start multi-object tracking
+#   14808 CMD_MOT_WIDE_TRACK_ONE {id}         -> lock a detected object by id (wide)
+#   14805 CMD_MOT_TRACK_ONE      {id}         -> lock a detected object by id (tele)
+# Detected boxes+ids arrive via 15238 / 15251 (multi) and 15252 (single)._
+
 # ── Focus commands (15000-15199) ──────────────────────────────────────────────
 CMD_FOCUS_AUTO_FOCUS                     = 15000
 CMD_FOCUS_MANUAL_SINGLE_STEP             = 15001
@@ -172,7 +193,22 @@ CMD_NOTIFY_MULTI_TRACK_RESULT            = 15238  # tele multi-box (nested repea
 CMD_NOTIFY_UFO_MODE_STATE                = 15240  # sentinel-UFO mode state
 CMD_NOTIFY_WIDE_MULTI_TRACK_RESULT       = 15251  # wide multi-box (nested repeated)
 CMD_NOTIFY_WIDE_TRACK_RESULT             = 15252  # wide single-target box {x,y,w,h}
+CMD_NOTIFY_WIDE_TRACK_STATE              = 15284  # CAPTURE-VERIFIED (June 2026): the
+        # firmware emits this during a wide track; payload {1: active, 2: state}.
+        # NOT present in the decompiled WsCmd table — found by decoding a live
+        # iOS-app capture (see dwarf_capture_decode.py / TRACKING_FINDINGS.md).
 CMD_NOTIFY_TEMPERATURE                   = 15243
+
+# ── Tracking coordinate reference (CAPTURE-VERIFIED) ───────────────────────────
+# Track-result boxes are TOP-LEFT (x, y) + (w, h) in a FIXED reference frame,
+# NOT in normalised [0,1] and NOT in the live RTSP frame's pixel size. Across a
+# real session the box edges approached x+w≈1280 and y+h≈720, i.e. a 1280x720
+# reference. Scale boxes by these constants (or the value the firmware actually
+# renders against) rather than the decoded frame dimensions when the wide RTSP
+# stream is delivered at a different resolution.
+TRACK_REF_W = 1280
+TRACK_REF_H = 720
+TRACK_NO_TARGET = -100   # firmware sends x=y=-100 (negative varint) when no lock
 
 # Tracker error / status codes (arrive as the packet cmd id, 4.14.2)
 CODE_TRACK_TRACKER_INITING               = 14900  # tracker is initializing
@@ -244,6 +280,36 @@ def _parse_varint_fields(data):
                 v, i = _dvarint(data, i); out[fn] = _to_signed(v)
             elif wt == 2:
                 ln, i = _dvarint(data, i); i += ln
+            elif wt == 1:
+                i += 8
+            elif wt == 5:
+                i += 4
+            else:
+                break
+    except IndexError:
+        pass
+    return out
+
+def _parse_multi_track(data):
+    """Best-effort decode of CMD_NOTIFY_MULTI_TRACK_RESULT (15238) /
+    CMD_NOTIFY_WIDE_MULTI_TRACK_RESULT (15251). The exact layout is undocumented
+    (no populated sample captured yet); this treats each top-level length-delimited
+    field as one detected-object sub-message and returns its varint fields, e.g.
+    {1:id, 2:x, 3:y, 4:w, 5:h} OR {1:x,2:y,3:w,4:h} depending on firmware. Refine
+    the field mapping once a real multi-box sample is captured with
+    dwarf_capture_decode.py."""
+    out = []
+    i, n = 0, len(data)
+    try:
+        while i < n:
+            tag, i = _dvarint(data, i); fn = tag >> 3; wt = tag & 7
+            if wt == 2:
+                ln, i = _dvarint(data, i); sub = data[i:i + ln]; i += ln
+                f = _parse_varint_fields(sub)
+                if f:
+                    out.append(f)
+            elif wt == 0:
+                _, i = _dvarint(data, i)
             elif wt == 1:
                 i += 8
             elif wt == 5:
@@ -355,9 +421,13 @@ class DwarfLab:
             "calibrating": False,
             "focus_position": None,
             "last_cmd": None,
-            "track_box": None,      # (x, y, w, h) live tracked box in frame px
+            "track_box": None,      # (x, y, w, h) live tracked box in TRACK_REF px
             "track_box_ts": 0.0,    # time.time() of last track-box update
             "track_box_src": None,  # "tele" | "wide"
+            "track_state": None,    # (active, state) from CMD_NOTIFY_WIDE_TRACK_STATE
+            "multi_boxes": [],      # detected objects from MOT (15238/15251)
+            "multi_boxes_ts": 0.0,
+            "multi_boxes_src": None,
         }
 
     def _ws_url(self):
@@ -478,6 +548,22 @@ class DwarfLab:
                 self.state["track_box_ts"] = time.time()
                 self.state["track_box_src"] = (
                     "wide" if cmd == CMD_NOTIFY_WIDE_TRACK_RESULT else "tele")
+            except: pass
+
+        # Wide track state (CAPTURE-VERIFIED; absent from the APK table)
+        elif cmd == CMD_NOTIFY_WIDE_TRACK_STATE:
+            try:
+                f = _parse_varint_fields(data)
+                self.state["track_state"] = (f.get(1, 0), f.get(2, 0))
+            except: pass
+
+        # Multi-object detection results (MOT) — detected boxes + ids
+        elif cmd in (CMD_NOTIFY_MULTI_TRACK_RESULT, CMD_NOTIFY_WIDE_MULTI_TRACK_RESULT):
+            try:
+                self.state["multi_boxes"] = _parse_multi_track(data)
+                self.state["multi_boxes_ts"] = time.time()
+                self.state["multi_boxes_src"] = (
+                    "wide" if cmd == CMD_NOTIFY_WIDE_MULTI_TRACK_RESULT else "tele")
             except: pass
 
         if self.on_notify: self.on_notify(pkt)
@@ -627,17 +713,102 @@ class DwarfLab:
     def start_tracking(self):        self.send(CMD_TRACK_START_TRACK)
     def stop_tracking(self):         self.send(CMD_TRACK_STOP_TRACK)
 
-    def start_track_roi(self, x, y, w, h):
+    # ── V3 camera + MOT (Multi-Object Tracking) pipeline ───────────────────────
+    # The DWARF 3 (V3 firmware) AI subject tracking runs through the 30-class
+    # object detector + MOT, NOT the basic 14800 correlation tracker. Typical
+    # sequence (each step waits for the device to settle):
+    #   v3_open_wide() -> wide_tele_track_switch(1) -> start_mot()
+    #   ... device streams detected boxes+ids on 15251/15238 ...
+    #   mot_wide_track_one(id)  -> lock the chosen object
+    # WARNING: in live probing, sending V3 open-camera commands out of the app's
+    # exact order destabilised the device (it emitted POWER_OFF 15229 and dropped
+    # the link). Drive these deliberately, one at a time, and watch the hardware.
+    def v3_open_tele(self, action=1):   # 1 = open, 0 = close
+        return self.send(CMD_V3_CAMERA_TELE_OPEN_CAMERA, _field(1, 0, int(action)))
+
+    def v3_open_wide(self, close=False):
+        # CAPTURE-VERIFIED: app OPENS wide with an EMPTY payload (no action field);
+        # sending {1:1} = CLOSE and destabilised the device. Only send a field to
+        # close.
+        data = _field(1, 0, 1) if close else b""
+        return self.send(CMD_V3_CAMERA_WIDE_OPEN_CAMERA, data)
+
+    def wide_tele_track_switch(self, camera=1):  # 0 = tele, 1 = wide; enables detector
+        return self.send(CMD_WIDE_TELE_TRACK_SWITCH, _field(1, 0, int(camera)))
+
+    def start_mot(self):
+        """CMD_MOT_START (14804) — start multi-object detection/tracking."""
+        return self.send(CMD_MOT_START)
+
+    def mot_wide_track_one(self, obj_id):
+        """CMD_MOT_WIDE_TRACK_ONE (14808) — lock a detected wide object by id."""
+        return self.send(CMD_MOT_WIDE_TRACK_ONE, _field(1, 0, int(obj_id)))
+
+    def mot_tele_track_one(self, obj_id):
+        """CMD_MOT_TRACK_ONE (14805) — lock a detected tele object by id."""
+        return self.send(CMD_MOT_TRACK_ONE, _field(1, 0, int(obj_id)))
+
+    def start_track_roi(self, x, y, w, h, field5=1):
         """
         CMD_TRACK_START_TRACK (14800) with a manual ROI.
-        ReqStartTrack { int32 x=1; int32 y=2; int32 w=3; int32 h=4 } in *frame
-        pixel* coordinates. The device locks onto a distinct moving object inside
-        the box and drives the motors to keep it centred.
+        ReqStartTrack { int32 x=1; int32 y=2; int32 w=3; int32 h=4; int32 f5=5 }
+        Coordinates are in *wide-stream pixel* space (≈1920x1080, NOT 1280x720).
+
+        CAPTURE-VERIFIED: the iOS app sends a FIFTH field (=1) that the public
+        proto omits, AND only locks reliably after the V3 camera bring-up
+        (v3_mode_switch + v3_open_tele/wide). Sending the 4-field form alone runs
+        the basic correlation tracker, which usually fails to lock (returns -100).
+        A real app lock observed here was 2592/2592 valid boxes with f5=1.
         """
         x, y, w, h = int(x), int(y), int(w), int(h)
         data = (_field(1, 0, x) + _field(2, 0, y) +
                 _field(3, 0, w) + _field(4, 0, h))
+        if field5 is not None:
+            data += _field(5, 0, int(field5))
         return self.send(CMD_TRACK_START_TRACK, data)
+
+    def v3_mode_switch(self, value=1):
+        """CMD_V3_DEVICE_CONFIG_MODE_SWITCH (16404). CAPTURE-VERIFIED payload:
+        V3ReqModeSwitch { inner(3) { value(1) = 1 } } — i.e. {3:{1:1}}. Puts the
+        V3 firmware into the camera/tracking mode before opening cameras."""
+        return self.send(CMD_V3_DEVICE_CONFIG_MODE_SWITCH,
+                         _field(3, 2, _field(1, 0, int(value))))
+
+    def track_box_normalized(self):
+        """Return the current tracked box as (nx, ny, nw, nh) in [0,1], using the
+        CAPTURE-VERIFIED fixed reference frame (TRACK_REF_W x TRACK_REF_H) rather
+        than the live decoded video size. Returns None when there is no fresh
+        lock. Multiply by your display rect to overlay correctly regardless of the
+        RTSP stream resolution."""
+        box = self.state.get("track_box")
+        if (not box or box[0] <= TRACK_NO_TARGET or box[1] <= TRACK_NO_TARGET):
+            return None
+        x, y, w, h = box
+        return (x / TRACK_REF_W, y / TRACK_REF_H, w / TRACK_REF_W, h / TRACK_REF_H)
+
+    # ── App-level keepalives (CAPTURE-VERIFIED) ────────────────────────────────
+    # The iOS app keeps the session alive with TWO heartbeats the controller did
+    # not previously send: a WebSocket TEXT "ping" frame, and a UDP :9900 protobuf
+    # {1:1, 2:<unix_ms>, 3:"txtl"}. websocket-client's protocol-level PING (used
+    # in _start_ws) is usually sufficient, but if the firmware drops the tracker
+    # or host-lock when only protocol pings are seen, enable these to mimic the
+    # app exactly. Opt-in so existing behaviour is unchanged.
+    def start_app_keepalive(self, ws_ping=True, udp_txtl=True, interval=1.0):
+        def _loop():
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if udp_txtl else None
+            while self._connected.is_set():
+                if ws_ping and self._ws:
+                    try: self._ws.send("ping")           # text frame (opcode 1)
+                    except Exception: pass
+                if udp and udp_txtl:
+                    pkt = (_field(1, 0, 1) +
+                           _field(2, 0, int(time.time() * 1000)) +
+                           _field(3, 2, "txtl"))
+                    try: udp.sendto(pkt, (self.host, self.WS_PORT))
+                    except Exception: pass
+                time.sleep(interval)
+            if udp: udp.close()
+        threading.Thread(target=_loop, daemon=True, name="dwarf-keepalive").start()
 
     def set_master_lock(self, lock=True):
         """

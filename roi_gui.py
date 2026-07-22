@@ -54,6 +54,9 @@ from dwarflab_controller import (  # noqa: E402
     CMD_NOTIFY_UFO_MODE_STATE,
     CODE_TRACK_TRACKER_INITING,
     CODE_TRACK_TRACKER_FAILED,
+    TRACK_REF_W,
+    TRACK_REF_H,
+    TRACK_NO_TARGET,
 )
 
 _SENTRY_STATE = {0: "IDLE", 1: "INIT", 2: "DETECT", 3: "TRACK",
@@ -156,6 +159,8 @@ class App:
         self._rect_id: int | None = None
         self._photo: ImageTk.PhotoImage | None = None
         self._tracking = False   # closed loop requested (Start Track pressed)
+        self._mot = False        # MOT detector running (AI Track pressed)
+        self._multi_disp = []    # [(id, sx, sy, ex, ey)] clickable detected boxes
         self._moving = False     # joystick currently commanded non-zero
         self._slewing = False    # a manual Center-on-ROI slew is in progress
         # live diagnostics captured from the device notify stream (WS thread)
@@ -180,7 +185,7 @@ class App:
         bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
 
         tk.Label(bar, text="Camera:", fg="#ddd", bg="#1a1a1f").pack(side=tk.LEFT)
-        self.cam_var = tk.StringVar(value=list(CAMERAS)[0])
+        self.cam_var = tk.StringVar(value="Wide (ch1)")
         cam = ttk.Combobox(bar, textvariable=self.cam_var, values=list(CAMERAS),
                            state="readonly", width=12)
         cam.pack(side=tk.LEFT, padx=(4, 12))
@@ -193,6 +198,9 @@ class App:
         self.btn_track = tk.Button(bar, text="Start Track ROI", width=14,
                                    state=tk.DISABLED, command=self._start_track)
         self.btn_track.pack(side=tk.RIGHT)
+        self.btn_ai = tk.Button(bar, text="AI Track (MOT)", width=13,
+                                state=tk.DISABLED, command=self._start_ai_track)
+        self.btn_ai.pack(side=tk.RIGHT, padx=4)
         self.btn_center = tk.Button(bar, text="Center on ROI", width=13,
                                     state=tk.DISABLED, command=self._center_on_roi)
         self.btn_center.pack(side=tk.RIGHT, padx=4)
@@ -323,6 +331,7 @@ class App:
         self._start_stream()
         self.btn_connect.config(text="Disconnect")
         self.btn_track.config(state=tk.NORMAL)
+        self.btn_ai.config(state=tk.NORMAL)
         self.btn_center.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.NORMAL)
         for b in self.mode_btns.values():
@@ -335,11 +344,12 @@ class App:
     def _open_camera(self) -> None:
         if self.ctl is None:
             return
-        self.ctl.enter_camera(encode_type=1)
-        if CAMERAS[self.cam_var.get()] == "ch1":
-            self.ctl.open_camera_wide()
-        else:
-            self.ctl.open_camera()
+        # CAPTURE-VERIFIED V3 bring-up (the app's order). This is what arms the
+        # firmware so 14800 actually locks. NOTE: open wide with an EMPTY payload
+        # (v3_open_wide) — {1:1} = CLOSE and knocks the device offline.
+        self.ctl.v3_mode_switch(1)     # 16404 {3:{1:1}}
+        self.ctl.v3_open_tele(1)       # 10050 {1:1}
+        self.ctl.v3_open_wide()        # 12036 (empty) = open
 
     def _disconnect(self) -> None:
         self._stop_stream()
@@ -358,6 +368,7 @@ class App:
         self._moving = False
         self.btn_connect.config(text="Connect")
         self.btn_track.config(state=tk.DISABLED)
+        self.btn_ai.config(state=tk.DISABLED)
         self.btn_center.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.DISABLED)
         for b in self.mode_btns.values():
@@ -413,17 +424,23 @@ class App:
                                  tags="video")
         self.canvas.tag_lower("video")
         self._draw_track_box(ox, oy, dw, dh, fw, fh)
+        self._draw_multi_boxes(ox, oy, dw, dh, fw, fh)
         if self._rect_id is not None:
             self.canvas.tag_raise(self._rect_id)
 
     def _draw_track_box(self, ox, oy, dw, dh, fw, fh) -> None:
-        """Overlay the live (morphing) box the firmware is tracking, in green."""
+        """Overlay the live (morphing) box the firmware is tracking, in green.
+
+        CAPTURE-VERIFIED: box coords are in WIDE-STREAM PIXELS (≈1920x1080 — an
+        app ROI of x=975,w=382 gives x+w=1357 > 1280, so the space is NOT
+        1280x720). The decoded RTSP frame is that same space, so scale by fw/fh.
+        """
         self.canvas.delete("trackbox")
         if self.ctl is None or fw == 0:
             return
         box = self.ctl.state.get("track_box")
         ts = self.ctl.state.get("track_box_ts", 0.0)
-        if (not box or box[0] <= -100 or box[1] <= -100
+        if (not box or box[0] <= TRACK_NO_TARGET or box[1] <= TRACK_NO_TARGET
                 or (time.time() - ts) > BOX_STALE_S):
             return
         bx, by, bw, bh = box
@@ -433,6 +450,55 @@ class App:
         ey = oy + (by + bh) / fh * dh
         self.canvas.create_rectangle(sx, sy, ex, ey, outline="#39ff14",
                                      width=2, tags="trackbox")
+
+    @staticmethod
+    def _interpret_multi(d, idx):
+        """Best-effort map of a parsed multi-track sub-message to (id,x,y,w,h) in
+        TRACK_REF space. UNVERIFIED field layout — refine when a populated
+        15238/15251 sample is captured."""
+        if all(k in d for k in (1, 2, 3, 4, 5)):
+            return d[1], d[2], d[3], d[4], d[5]          # {id,x,y,w,h}
+        if all(k in d for k in (1, 2, 3, 4)):
+            return idx, d[1], d[2], d[3], d[4]           # {x,y,w,h}, id=index
+        return None
+
+    def _draw_multi_boxes(self, ox, oy, dw, dh, fw, fh) -> None:
+        """Draw MOT-detected objects (cyan, clickable) from state['multi_boxes'].
+        Coords assumed in stream pixels (same space as the single-track box)."""
+        self.canvas.delete("multibox")
+        self._multi_disp = []
+        if self.ctl is None or not self._mot or fw == 0:
+            return
+        boxes = self.ctl.state.get("multi_boxes") or []
+        ts = self.ctl.state.get("multi_boxes_ts", 0.0)
+        if (time.time() - ts) > BOX_STALE_S:
+            return
+        for idx, d in enumerate(boxes):
+            parsed = self._interpret_multi(d, idx)
+            if not parsed:
+                continue
+            oid, x, y, w, h = parsed
+            sx = ox + x / fw * dw
+            sy = oy + y / fh * dh
+            ex = ox + (x + w) / fw * dw
+            ey = oy + (y + h) / fh * dh
+            self.canvas.create_rectangle(sx, sy, ex, ey, outline="#22d3ee",
+                                         width=2, tags="multibox")
+            self.canvas.create_text(sx + 3, sy + 3, anchor=tk.NW, fill="#22d3ee",
+                                     text=f"id {oid}", tags="multibox")
+            self._multi_disp.append((oid, sx, sy, ex, ey))
+
+    def _select_multi_at(self, x, y) -> bool:
+        """If (x,y) hits a detected box, lock it via MOT_WIDE_TRACK_ONE."""
+        for oid, sx, sy, ex, ey in self._multi_disp:
+            if sx <= x <= ex and sy <= y <= ey:
+                if self.ctl is not None:
+                    self.ctl.mot_wide_track_one(oid)
+                    self._tracking = True
+                    self._status(f"Locking detected object id {oid} "
+                                 "(MOT_WIDE_TRACK_ONE).")
+                return True
+        return False
 
     # ── ROI mouse handlers ───────────────────────────────────────────────────
     def _in_disp(self, x: int, y: int) -> bool:
@@ -451,6 +517,10 @@ class App:
         return int(fx), int(fy)
 
     def _on_press(self, e) -> None:
+        # In MOT mode, a click on a detected (cyan) box locks that object instead
+        # of starting a drag-selection.
+        if self._mot and self._select_multi_at(e.x, e.y):
+            return
         if not self._in_disp(e.x, e.y):
             return
         self._drag_start = (e.x, e.y)
@@ -498,21 +568,63 @@ class App:
             self._rect_id = None
         self._status("ROI cleared.")
 
+    def _hide_roi_rect(self) -> None:
+        """Remove the blue dashed selection rectangle from the canvas but keep
+        self.roi (used by Center-on-ROI). Called right after a track command so
+        the device's response box (green overlay / any burned-in box) is what you
+        see, not your own selection."""
+        if self._rect_id is not None:
+            self.canvas.delete(self._rect_id)
+            self._rect_id = None
+
     # ── tracking ─────────────────────────────────────────────────────────────
     def _start_track(self) -> None:
         if self.ctl is None or self.roi is None:
             self._status("Select a ROI first (drag on the video).")
             return
+        # self.roi is already in stream-pixel space (the decoded RTSP frame IS the
+        # wide stream, ~1920x1080). start_track_roi() appends the CAPTURE-VERIFIED
+        # 5th field (=1) the app sends; together with the V3 camera bring-up done
+        # on connect, this is the recipe that actually locks.
         x, y, w, h = self.roi
-        ok = self.ctl.start_track_roi(x, y, w, h)
+        ok = self.ctl.start_track_roi(x, y, w, h)   # 5th field added in controller
         self._tracking = ok
+        if ok:
+            self._hide_roi_rect()   # clear the blue dashed box so the response box shows
         self._status(
-            f"Track ROI sent (x={x} y={y} w={w} h={h}). "
-            "Auto-center will drive motors once a target locks."
+            f"Track ROI sent ({x},{y},{w},{h}) +f5=1. Blue cleared; watch for green."
             if ok else "Send failed — not connected.")
+
+    def _start_ai_track(self) -> None:
+        """EXPERIMENTAL DWARF3 V3 MOT path (the real subject-tracking pipeline).
+
+        Enables the 30-class object detector (CMD_WIDE_TELE_TRACK_SWITCH 14809)
+        and multi-object tracking (CMD_MOT_START 14804). The device then streams
+        detected objects on 15238/15251 — drawn here in CYAN with their id. Click
+        a cyan box to lock that object (CMD_MOT_WIDE_TRACK_ONE 14808 {id}); the
+        locked target then reports on 15252 (green box) and auto-center drives it.
+
+        UNVERIFIED end-to-end: the lab device went offline during development, and
+        the 15238/15251 box/id field layout is best-effort (see
+        dwarflab_controller._parse_multi_track). Drive deliberately and watch the
+        hardware — sending V3 commands out of order destabilised the device once.
+        """
+        if self.ctl is None:
+            self._status("Connect first.")
+            return
+        self.ctl.set_master_lock(True)
+        cam = CAMERAS.get(self.cam_var.get())
+        self.ctl.wide_tele_track_switch(1 if cam == "ch1" else 0)  # enable detector
+        self.ctl.start_mot()                                       # start MOT
+        self._mot = True
+        self._hide_roi_rect()
+        self._status("MOT detector started — click a CYAN detected box to lock it.")
 
     def _stop_track(self) -> None:
         self._tracking = False
+        self._mot = False
+        self._multi_disp = []
+        self.canvas.delete("multibox")
         if self.ctl is not None:
             if self._moving:
                 self.ctl.joystick_stop()
@@ -724,6 +836,9 @@ class App:
                 parts.append(f"ufo={d['ufo_state']}")
             if d["tracker"] is not None:
                 parts.append(f"tracker={d['tracker']}")
+            tstate = self.ctl.state.get("track_state")
+            if tstate is not None:
+                parts.append(f"wtrack_state={tstate}")   # cmd 15284 (capture-found)
             ws = "up" if self.ctl.state.get("connected") else "DOWN"
             self.diag_var.set(f"diag[ws={ws}]: " + "  ".join(parts))
         self.root.after(300, self._diag_tick)
@@ -757,13 +872,16 @@ class App:
         ts = self.ctl.state.get("track_box_ts", 0.0)
         fw, fh = self._frame_wh
         stale = (time.time() - ts) > BOX_STALE_S
-        lost = (not box or fw == 0 or box[0] <= -100 or box[1] <= -100 or stale)
+        lost = (not box or fw == 0 or box[0] <= TRACK_NO_TARGET
+                or box[1] <= TRACK_NO_TARGET or stale)
         if lost:
             if self._moving:
                 self.ctl.joystick_stop()
                 self._moving = False
             self._status("tracking: searching for target (no lock) — motors idle.")
             return
+        # Box coords are in stream pixels (== decoded frame size), so normalise
+        # the centring error against fw/fh.
         x, y, w, h = box
         bx, by = x + w / 2.0, y + h / 2.0
         nx = (bx - fw / 2.0) / (fw / 2.0)
