@@ -196,3 +196,36 @@ the machine-readable copy used for motor centring. This was NOT yet pixel-tested
 * **Quick experiment:** run `roi_gui.py` (which draws the box GREEN from `15252`)
   against the live feed. If you also see an ORANGE box → it is in the video. If
   you only see green → the app draws it from the protobuf.
+
+## Schema-aware deciphering layer (`dwarf_protobuf.py`)
+
+The original capture decoder could reconstruct the transport and spot *that* a
+command was unknown, but it dumped payloads as anonymous `fN` blobs — a goto
+RA/Dec showed up as two 19-digit `i64` integers, a joystick vector as an opaque
+8-byte field. `dwarf_protobuf.py` adds the missing decode layer so a packet is
+actually **deciphered**, not just framed:
+
+* **Wire-type-aware value interpretation.** Varints decode as int / signed /
+  zigzag / bool; wire-type 1 → `double` (RA/Dec, lat/lon, joystick, altitude all
+  use doubles); wire-type 5 → `float`; length-delimited auto-resolves to
+  nested-message / string / bytes. The `-100` no-target sentinel decodes as the
+  signed `-100` it is.
+* **A schema registry** (`SCHEMAS`) mapping ~29 known command ids to named, typed
+  fields and enum tables, grounded in the controller's payload builders and the
+  capture-verified findings above. `decode_wscmd()` decodes the envelope AND its
+  `data` payload against the schema selected by the packet's own `cmd`, resolving
+  `type` to REQUEST/RESPONSE/NOTIFY/ACK and unknown ids to a generic typed decode
+  flagged `payload_schema:"generic"` so new firmware fields stand out.
+* **No new dependencies**, self-tested (`python3 dwarf_protobuf.py`), and imports
+  the controller's `CMD_` names when available (falls back to an inline table).
+
+New `dwarf_capture_decode.py` flags built on it:
+
+| flag | what it deciphers |
+|---|---|
+| `--decode-requests` | phone→device request payloads (goto/location/joystick/track-ROI), which the old tool ignored — it only decoded notifies |
+| `--json FILE` | every deciphered frame, both directions, as NDJSON for downstream analysis |
+| `--mot-layout` | scores candidate field layouts for the still-unverified multi-object-track notifies (15238/15251) against a real capture — the concrete way to finally pin down the `{id,x,y,w,h}` order noted as unresolved in §6 |
+
+The generic "unknown payload" dump now also annotates wire-type 1/5 fields with
+their `double`/`float` value, so even an unmapped command is readable at a glance.

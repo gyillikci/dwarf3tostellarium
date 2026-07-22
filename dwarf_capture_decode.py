@@ -33,16 +33,39 @@ WHAT THIS CAPTURE PROVED the APK-only model in dwarflab_controller.py missed
   4. "No target" sentinel — x and y arrive as -100 (negative varint). The
      controller already handles this; documented here for completeness.
 
+NEW — schema-aware deciphering (via dwarf_protobuf.py):
+  * payloads decode to NAMED, TYPED fields instead of anonymous fN blobs — a goto
+    request reads {ra, dec, name, goto_only}, a location {lat, lon, alt}, a joystick
+    {angle_deg, length}; the envelope `type` resolves to REQUEST/RESPONSE/NOTIFY/ACK.
+  * --decode-requests dumps the deciphered phone->device command payloads (the old
+    tool only looked at device->phone notifies).
+  * --json writes every deciphered frame (both directions) as NDJSON for analysis.
+  * --mot-layout scores candidate field layouts for the still-unverified multi-
+    object-track notifies (15238/15251) from a real capture.
+  * even the "unknown payload" dump now shows the double/float interpretation of
+    wire-type 1/5 fields (RA/Dec/lat/lon are doubles, not the raw uint64 shown before).
+
 Usage:
     python3 dwarf_capture_decode.py capture.pcapng
     python3 dwarf_capture_decode.py capture.pcapng --port 9900 --boxes-csv boxes.csv
+    python3 dwarf_capture_decode.py capture.pcapng --decode-requests --json frames.ndjson
+    python3 dwarf_capture_decode.py capture.pcapng --mot-layout
 """
 from __future__ import annotations
 
 import argparse
+import json
 import struct
 import sys
 from collections import defaultdict
+
+# Schema-aware deciphering layer (typed values, named fields, enum resolution,
+# request-payload decode). Optional — the tool still runs its transport/box
+# analysis if this module is missing, it just won't decipher payloads.
+try:
+    import dwarf_protobuf as PB  # type: ignore
+except Exception:  # pragma: no cover
+    PB = None
 
 # Command-id -> name. Imported from the controller when available so the two
 # files never drift; falls back to an inline subset for standalone use.
@@ -133,9 +156,13 @@ def dump_pb(data: bytes, indent: int = 0) -> list:
                     out.append(f"{pad}f{fn} bytes({ln}) = {seg.hex(' ')}")
                     out += dump_pb(seg, indent + 1)
             elif wt == 1:
-                out.append(f"{pad}f{fn} i64 = {struct.unpack_from('<Q', data, i)[0]}"); i += 8
+                u = struct.unpack_from('<Q', data, i)[0]
+                dbl = struct.unpack_from('<d', data, i)[0]; i += 8
+                out.append(f"{pad}f{fn} i64 = {u}  (double {dbl:.6g})")
             elif wt == 5:
-                out.append(f"{pad}f{fn} i32 = {struct.unpack_from('<I', data, i)[0]}"); i += 4
+                u = struct.unpack_from('<I', data, i)[0]
+                flt = struct.unpack_from('<f', data, i)[0]; i += 4
+                out.append(f"{pad}f{fn} i32 = {u}  (float {flt:.6g})")
             else:
                 break
     except (IndexError, struct.error):
@@ -259,12 +286,91 @@ def iter_ws_frames(stream: bytes):
         yield op, bytes(payload)
 
 
+# ── MOT layout scorer ───────────────────────────────────────────────────────────
+def score_mot_layout(samples: list) -> None:
+    """Infer the field layout of the multi-object-track notifies (15238/15251),
+    whose sub-message schema is still unverified (TRACKING_FINDINGS.md §6). Each
+    top-level length-delimited field is treated as one detected object; we gather
+    per-field value statistics across every object, then score two candidate maps
+    against a plausible pixel frame."""
+    per_field = defaultdict(list)   # field_no -> [values]
+    obj_count = 0
+    for data in samples:
+        i, n = 0, len(data)
+        try:
+            while i < n:
+                tag, i = read_varint(data, i); fn, wt = tag >> 3, tag & 7
+                if wt == 2:
+                    ln, i = read_varint(data, i); sub = data[i:i + ln]; i += ln
+                    f = decode_fields(sub)
+                    if f:
+                        obj_count += 1
+                        for k, v in f.items():
+                            if isinstance(v, int):
+                                per_field[k].append(v)
+                elif wt == 0:
+                    _, i = read_varint(data, i)
+                elif wt == 1:
+                    i += 8
+                elif wt == 5:
+                    i += 4
+                else:
+                    break
+        except (IndexError, struct.error):
+            pass
+
+    if not per_field:
+        print(f"  {len(samples)} sample(s) but no nested sub-messages decoded — "
+              "the layout may not be nested-per-object; dump one raw with dump_pb.")
+        return
+    print(f"  {len(samples)} notify sample(s), {obj_count} object sub-message(s)")
+    print("  per sub-field value ranges:")
+    for fn in sorted(per_field):
+        vals = per_field[fn]
+        print(f"    f{fn}: count={len(vals):<5} min={min(vals):>6} "
+              f"max={max(vals):>6} distinct={len(set(vals))}")
+
+    def plausible_box(xf, yf, wf, hf):
+        for f in (xf, yf, wf, hf):
+            if f not in per_field:
+                return None
+        ws = per_field[wf]; hs = per_field[hf]
+        if min(ws) <= 0 or min(hs) <= 0:
+            return None  # width/height must be positive
+        xw = max(per_field[xf]) + max(ws); yh = max(per_field[yf]) + max(hs)
+        # sane if extents stay within a generous wide-frame band
+        return xw <= 4096 and yh <= 4096
+
+    candidates = [
+        ("{1:id, 2:x, 3:y, 4:w, 5:h}", 2, 3, 4, 5),
+        ("{1:x, 2:y, 3:w, 4:h}",       1, 2, 3, 4),
+        ("{1:id, 2:cls, 3:x, 4:y, 5:w, 6:h}", 3, 4, 5, 6),
+    ]
+    print("  candidate layout scoring:")
+    for label, xf, yf, wf, hf in candidates:
+        verdict = plausible_box(xf, yf, wf, hf)
+        mark = "n/a (missing fields)" if verdict is None else ("PLAUSIBLE" if verdict
+               else "rejected (impossible extents/size)")
+        print(f"    {label:<38} {mark}")
+    print("  NOTE: confirm against a capture where the app is actively AI-tracking "
+          "multiple subjects; a single-object sample cannot disambiguate id vs x.")
+
+
 # ── report ─────────────────────────────────────────────────────────────────────
 def main() -> int:
     ap = argparse.ArgumentParser(description="Offline DWARF 3 tracking-protocol decoder")
     ap.add_argument("pcapng", help="capture file (Wireshark or `pktmon etl2pcap` output)")
     ap.add_argument("--port", type=int, default=9900, help="DWARF control/WebSocket port")
     ap.add_argument("--boxes-csv", help="write the full track-box time series to CSV")
+    ap.add_argument("--json", dest="json_out", metavar="FILE",
+                    help="write every deciphered WsCmd frame (both directions, "
+                         "typed + schema-named payloads) as NDJSON")
+    ap.add_argument("--decode-requests", action="store_true",
+                    help="also decipher client->device request payloads "
+                         "(goto/location/joystick/track-ROI), not just notifies")
+    ap.add_argument("--mot-layout", action="store_true",
+                    help="score candidate field layouts for the multi-object "
+                         "track notifies (15238/15251) from the capture")
     args = ap.parse_args()
 
     dirs, udp = extract_streams(args.pcapng, args.port)
@@ -280,7 +386,13 @@ def main() -> int:
     boxes = []                # (cmd, x, y, w, h)
     text_frames = defaultdict(int)
     unknown_dumps = {}
-    for key, data in dirs.items():
+    timeline = []             # deciphered frames, in capture order, for NDJSON
+    requests = {}             # cmd -> one deciphered request payload (phone->device)
+    mot_samples = []          # raw payloads of 15238/15251 for layout scoring
+    for (src, sp, dst, dp), data in dirs.items():
+        # Direction from the TCP port: to the device port = request, from it = notify
+        to_device = dp == args.port
+        direction = "phone->device" if to_device else "device->phone"
         for op, payload in iter_ws_frames(data):
             if op == 1:
                 text_frames[payload.decode("ascii", "replace")] += 1
@@ -295,6 +407,15 @@ def main() -> int:
                                   f.get(3, 0), f.get(4, 0)))
                 elif cmd not in CMD_NAMES and cmd not in unknown_dumps:
                     unknown_dumps[cmd] = dump_pb(pk["data"])
+                if cmd in (15238, 15251) and pk["data"]:
+                    mot_samples.append(pk["data"])
+                # Schema-aware decipher (typed values, enum names) for export + requests
+                if PB is not None:
+                    dec = PB.decode_wscmd(payload)
+                    dec["direction"] = direction
+                    timeline.append(dec)
+                    if to_device and cmd not in requests:
+                        requests[cmd] = dec
 
     print("\n== WsCmd histogram ==")
     for cmd in sorted(hist):
@@ -336,6 +457,33 @@ def main() -> int:
         tag = tag.decode("ascii", "replace") if isinstance(tag, (bytes, bytearray)) else tag
         print(f"\n== UDP :{args.port} heartbeat ({len(udp)} packets) ==")
         print(f"  {src} -> {dst}: {{1:{f.get(1)}, 2:{f.get(2)} (unix-ms), 3:{tag!r}}}")
+
+    # Deciphered request payloads (phone -> device) — schema-decoded
+    if args.decode_requests and requests:
+        print("\n== Deciphered request payloads (phone -> device) ==")
+        for cmd in sorted(requests):
+            dec = requests[cmd]
+            flag = "" if dec.get("payload_schema") == "known" else "  [generic — repo gap]"
+            print(f"  {cmd:<6} {dec['cmd_name']}{flag}")
+            print(f"         {json.dumps(dec['payload'], ensure_ascii=False)}")
+
+    # Multi-object-track layout scoring (15238/15251) — the still-unverified field map
+    if args.mot_layout:
+        print("\n== Multi-object track layout analysis (15238/15251) ==")
+        if not mot_samples:
+            print("  no 15238/15251 samples in this capture — "
+                  "record the app running AI/MOT tracking to populate it.")
+        else:
+            score_mot_layout(mot_samples)
+
+    # Full NDJSON export of every deciphered frame
+    if args.json_out and timeline:
+        with open(args.json_out, "w", encoding="utf-8") as fh:
+            for dec in timeline:
+                fh.write(json.dumps(dec, ensure_ascii=False) + "\n")
+        print(f"\nWrote {len(timeline)} deciphered frames to {args.json_out}")
+    elif args.json_out and PB is None:
+        print("\n--json requested but dwarf_protobuf.py is not importable; skipped.")
 
     if args.boxes_csv and boxes:
         with open(args.boxes_csv, "w", encoding="utf-8") as fh:
