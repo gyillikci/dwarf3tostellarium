@@ -154,16 +154,26 @@ SCHEMAS: dict[int, list[Field]] = {
     10050: [(1, "action", _ACTION)],                       # V3 open tele (1=open)
     12036: [(1, "action", _ACTION)],                       # V3 open wide (empty=open)
     11002: [(1, "ra", "double"), (2, "dec", "double"),
-            (3, "name", "str"), (4, "goto_only", "bool")],  # ReqGotoDSO
-    11013: [(1, "ra", "double"), (2, "dec", "double"),
-            (3, "name", "str"), (4, "goto_only", "bool")],  # one-click goto
-    # CAPTURE-VERIFIED 2026-07-23: ASTRO_START_ONE_CLICK_GOTO_SOLAR_SYSTEM request, seen
-    # sent phone->device with {solar_id:8, coord1:29.036198, coord2:41.08766, name:"Moon",
+            (3, "name", "str"), (4, "goto_only", "bool")],  # ReqGotoDSO — NOT re-verified
+            # against a live capture (unlike 11013 below); may have the same field-4 drift.
+    # CAPTURE-VERIFIED 2026-07-24: a live one-click-goto-DSO request (target "HD 89822")
+    # carried TWO more fields than this old 4-field model assumed, and the old field 4
+    # ("goto_only" bool) is actually a double on the wire — decode_with_schema silently
+    # ignored the schema's "bool" token and fell through to the wire-type-1 (double)
+    # branch, which is why the generic decode below showed goto_only=29.036102 instead
+    # of a bool. That value, and field 5 (41.087562), match — to 4 decimal places — the
+    # "coord1"/"coord2" fields seen in an unrelated 11014 (Moon) goto from a different
+    # session: not a coincidence. Both are the app's currently-configured OBSERVER
+    # lat/lon (from SYSTEM_SET_LOCATION / GPS), tacked onto every goto-family request
+    # for the device's local plate-solve/tracking math — not per-target data.
+    11013: [(1, "ra", "double"), (2, "dec", "double"), (3, "name", "str"),
+            (4, "lat", "double"), (5, "lon", "double"), (6, "mode", "int")],
+    # CAPTURE-VERIFIED 2026-07-23/24: ASTRO_START_ONE_CLICK_GOTO_SOLAR_SYSTEM request, seen
+    # sent phone->device with {solar_id:8, lat:29.036198, lon:41.08766, name:"Moon",
     # mode:9}; `confirm` (f6) only showed up on a second send once the app reported
-    # steady tracking. coord1/coord2 are doubles but whether they're ra/dec or alt/az
-    # (or something else) isn't confirmed yet — named neutrally until cross-checked
-    # against a known target's ephemeris.
-    11014: [(1, "solar_id", "int"), (2, "coord1", "double"), (3, "coord2", "double"),
+    # steady tracking. lat/lon here are the observer's own coordinates (see the 11013
+    # comment above for the cross-session match that pinned this down), not the target's.
+    11014: [(1, "solar_id", "int"), (2, "lat", "double"), (3, "lon", "double"),
             (4, "name", "str"), (5, "mode", "int"), (6, "confirm", "bool")],
     13004: [(1, "lock", "bool")],                           # ReqSetMasterLock
     13010: [(1, "lat", "double"), (2, "lon", "double"),
@@ -201,6 +211,11 @@ SCHEMAS: dict[int, list[Field]] = {
     15201: [(1, "battery", "int")],
     15202: [(1, "battery", "int")],
     15203: [(1, "temp", "px10"), (2, "cmos_temp", "px10")],
+    # CAPTURE-VERIFIED 2026-07-24, ONE sample only: {f1:true, f2:true} during a live
+    # one-click-goto (plate-solve) run. Naming f1/f2 would be a guess off a single data
+    # point, so they're left generic (f1/f2) until a capture with a FAILED solve or a
+    # false value on either field turns up to pin down what each one actually flags.
+    15210: [],
     15211: [(1, "state", _GOTO_STATE)],
     15212: [(1, "tracking", "bool")],
     15225: [(1, "x", "sint"), (2, "y", "sint"), (3, "w", "int"), (4, "h", "int")],
@@ -486,9 +501,13 @@ def _selftest() -> int:
     import json
     print("dwarf_protobuf self-test\n" + "=" * 40)
 
-    # 1) a goto-DSO request payload, wrapped in a WsCmd envelope
+    # 1) a one-click-goto-DSO request payload, wrapped in a WsCmd envelope. Field
+    # layout capture-verified 2026-07-24: {ra, dec, name, lat, lon, mode} — the
+    # trailing lat/lon are the OBSERVER's position (tacked onto every goto-family
+    # request), not the target's.
     goto = (_build_field(1, 1, 5.5757) + _build_field(2, 1, 22.0139) +
-            _build_field(3, 2, "M45") + _build_field(4, 0, 1))
+            _build_field(3, 2, "M45") + _build_field(4, 1, 48.8566) +
+            _build_field(5, 1, 2.3522) + _build_field(6, 0, 1))
     env = (_build_field(1, 0, 1) + _build_field(2, 0, 20) + _build_field(3, 0, 2) +
            _build_field(4, 0, 3) + _build_field(5, 0, 11013) + _build_field(6, 0, 0) +
            _build_field(7, 2, goto) + _build_field(8, 2, "uuid.171.iOS"))
@@ -497,7 +516,8 @@ def _selftest() -> int:
     assert d["cmd_name"].endswith("ONE_CLICK_GOTO_DSO")
     assert d["type_name"] == "REQUEST"
     assert abs(d["payload"]["ra"] - 5.5757) < 1e-4
-    assert d["payload"]["name"] == "M45" and d["payload"]["goto_only"] is True
+    assert d["payload"]["name"] == "M45" and d["payload"]["mode"] == 1
+    assert abs(d["payload"]["lat"] - 48.8566) < 1e-4
 
     # 2) a wide track-result notify carrying a box, plus the -100 no-target case
     box = (_build_field(1, 0, 975) + _build_field(2, 0, 280) +
