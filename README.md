@@ -54,3 +54,51 @@ Steps:
     - Click any object in the sky
     - Press Ctrl+1 (or right-click → Slew telescope to → Dwarf3)
     - The bridge logs GOTO → RA … Dec … and the Dwarf3 starts its one-click goto sequence (plate-solve → slew → track)
+
+---
+WitMotion IMU (polar alignment helper)
+
+`wit_imu.py` is a standalone helper for a WitMotion BLE IMU (WT901BLE / BWT901BLE
+class sensor), ported from the dwarfium project. Attach the sensor to the mount
+and it streams the tilt angle over Bluetooth in real time. The pitch angle (Y) is
+shown as "altitude": tilt the mount until it equals your latitude and the mount
+axis points at the celestial pole.
+
+It needs one extra dependency:
+
+  pip install bleak
+
+Usage:
+
+  # list nearby BLE devices to find the sensor's name/address
+  python3 wit_imu.py --scan
+
+  # connect to the first WitMotion sensor and print a live altitude readout
+  python3 wit_imu.py
+
+  # target a specific device and compare the pitch against your latitude
+  python3 wit_imu.py --address AA:BB:CC:DD:EE:FF --latitude 52.5200
+
+Sun calibration (finding the mount offset):
+
+The IMU only knows its own tilt, which differs from the telescope's true pointing
+by a fixed mounting offset. To measure that offset, switch the Dwarf to solar
+tracking so it points at the Sun, keep the sensor strapped on, then run:
+
+  python3 wit_imu.py --calibrate-sun --lat 52.5200 --lon 13.4050
+
+This computes the Sun's true altitude/azimuth from your location and the current
+time (system clock, UTC), averages the IMU reading for a few seconds, and saves
+the altitude/azimuth offset to `wit_calibration.json`. After that, plain
+`python3 wit_imu.py` shows corrected altitude/azimuth automatically.
+
+Notes:
+- Altitude calibration is gravity-referenced and reliable. Azimuth calibration
+  is only meaningful when the sensor outputs an absolute heading (9-DOF /
+  magnetometer mode) — in 6-DOF the yaw drifts.
+- If you'd rather use the Sun position the Dwarf reports (instead of computing
+  it), pass `--sun-alt` and `--sun-az` directly.
+
+The `WitIMU` class, `decode_frame()`, `sun_altaz()` and `Calibration` can also be
+imported into other scripts. Bluetooth only for now (the dwarfium USB/serial
+fallback was not ported).
