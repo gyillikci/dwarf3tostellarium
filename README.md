@@ -54,3 +54,31 @@ Steps:
     - Click any object in the sky
     - Press Ctrl+1 (or right-click → Slew telescope to → Dwarf3)
     - The bridge logs GOTO → RA … Dec … and the Dwarf3 starts its one-click goto sequence (plate-solve → slew → track)
+
+---
+WitMotion IMU (polar alignment helper)
+
+`wit_imu.py` is a standalone helper for a WitMotion BLE IMU (WT901BLE / BWT901BLE
+class sensor), ported from the dwarfium project. Attach the sensor to the mount
+and it streams the tilt angle over Bluetooth in real time. The pitch angle (Y) is
+shown as "altitude": tilt the mount until it equals your latitude and the mount
+axis points at the celestial pole.
+
+It needs one extra dependency:
+
+  pip install bleak
+
+Usage:
+
+  # list nearby BLE devices to find the sensor's name/address
+  python3 wit_imu.py --scan
+
+  # connect to the first WitMotion sensor and print a live altitude readout
+  python3 wit_imu.py
+
+  # target a specific device and compare the pitch against your latitude
+  python3 wit_imu.py --address AA:BB:CC:DD:EE:FF --latitude 52.5200
+
+The `WitIMU` class and `decode_frame()` can also be imported into other scripts if
+you want the readout somewhere else. Bluetooth only for now (the dwarfium USB/serial
+fallback was not ported).
