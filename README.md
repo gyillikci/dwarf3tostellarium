@@ -79,6 +79,26 @@ Usage:
   # target a specific device and compare the pitch against your latitude
   python3 wit_imu.py --address AA:BB:CC:DD:EE:FF --latitude 52.5200
 
-The `WitIMU` class and `decode_frame()` can also be imported into other scripts if
-you want the readout somewhere else. Bluetooth only for now (the dwarfium USB/serial
+Sun calibration (finding the mount offset):
+
+The IMU only knows its own tilt, which differs from the telescope's true pointing
+by a fixed mounting offset. To measure that offset, switch the Dwarf to solar
+tracking so it points at the Sun, keep the sensor strapped on, then run:
+
+  python3 wit_imu.py --calibrate-sun --lat 52.5200 --lon 13.4050
+
+This computes the Sun's true altitude/azimuth from your location and the current
+time (system clock, UTC), averages the IMU reading for a few seconds, and saves
+the altitude/azimuth offset to `wit_calibration.json`. After that, plain
+`python3 wit_imu.py` shows corrected altitude/azimuth automatically.
+
+Notes:
+- Altitude calibration is gravity-referenced and reliable. Azimuth calibration
+  is only meaningful when the sensor outputs an absolute heading (9-DOF /
+  magnetometer mode) — in 6-DOF the yaw drifts.
+- If you'd rather use the Sun position the Dwarf reports (instead of computing
+  it), pass `--sun-alt` and `--sun-az` directly.
+
+The `WitIMU` class, `decode_frame()`, `sun_altaz()` and `Calibration` can also be
+imported into other scripts. Bluetooth only for now (the dwarfium USB/serial
 fallback was not ported).

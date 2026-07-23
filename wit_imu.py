@@ -43,16 +43,32 @@ Usage
 
   # set the output rate to 10 Hz on connect
   python3 wit_imu.py --rate 10
+
+Sun calibration
+---------------
+The IMU reads its own tilt, which differs from the telescope's true pointing by
+a fixed mounting offset. To measure that offset, point the Dwarf at the Sun
+(solar tracking) with the sensor strapped on, then run:
+
+  python3 wit_imu.py --calibrate-sun --lat 48.8566 --lon 2.3522
+
+This computes the Sun's true altitude/azimuth from your location and the current
+time, averages the IMU reading, and saves the offset to wit_calibration.json.
+Afterwards `python3 wit_imu.py` shows corrected altitude/azimuth automatically.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import math
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 try:
     from bleak import BleakClient, BleakScanner
@@ -148,6 +164,180 @@ def decode_frame(raw: bytes) -> SensorData | None:
         acceleration=Vec3(acc(ax), acc(ay), acc(az)),
         angular_velocity=Vec3(gyro(gx), gyro(gy), gyro(gz)),
         angle=Vec3(ang(rx), ang(ry), ang(rz)),
+    )
+
+
+# ── solar position (NOAA algorithm) ───────────────────────────────────────────
+def _julian_day(dt_utc: datetime) -> float:
+    """Julian Day for a UTC datetime."""
+    year, month = dt_utc.year, dt_utc.month
+    day = dt_utc.day + (dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600) / 24
+    if month <= 2:
+        year -= 1
+        month += 12
+    a = year // 100
+    b = 2 - a + a // 4
+    return (
+        int(365.25 * (year + 4716))
+        + int(30.6001 * (month + 1))
+        + day + b - 1524.5
+    )
+
+
+def refraction(true_alt_deg: float) -> float:
+    """Atmospheric refraction (deg) to add to a true altitude to get the
+    apparent altitude a telescope actually centres on (Saemundsson's formula)."""
+    if true_alt_deg < -1.0:
+        return 0.0
+    r_arcmin = 1.02 / math.tan(
+        math.radians(true_alt_deg + 10.3 / (true_alt_deg + 5.11))
+    )
+    return r_arcmin / 60.0
+
+
+def sun_altaz(lat_deg: float, lon_deg: float, when_utc: datetime | None = None,
+              apply_refraction: bool = True) -> tuple[float, float]:
+    """Sun altitude and azimuth for an observer, using the NOAA algorithm.
+
+    Longitude is east-positive. Azimuth is measured from true North, clockwise
+    (0 = N, 90 = E, 180 = S, 270 = W). Altitude includes atmospheric refraction
+    by default, so it matches where the telescope mechanically points when the
+    Sun is centred. Returns ``(altitude_deg, azimuth_deg)``.
+    """
+    if when_utc is None:
+        when_utc = datetime.now(timezone.utc)
+
+    jd = _julian_day(when_utc)
+    t = (jd - 2451545.0) / 36525.0  # Julian centuries since J2000.0
+
+    l0 = (280.46646 + t * (36000.76983 + t * 0.0003032)) % 360  # mean longitude
+    m = 357.52911 + t * (35999.05029 - 0.0001537 * t)           # mean anomaly
+    e = 0.016708634 - t * (0.000042037 + 0.0000001267 * t)      # eccentricity
+    m_rad = math.radians(m)
+
+    c = (
+        (1.914602 - t * (0.004817 + 0.000014 * t)) * math.sin(m_rad)
+        + (0.019993 - 0.000101 * t) * math.sin(2 * m_rad)
+        + 0.000289 * math.sin(3 * m_rad)
+    )
+    true_long = l0 + c
+    omega = 125.04 - 1934.136 * t
+    lambda_sun = true_long - 0.00569 - 0.00478 * math.sin(math.radians(omega))
+
+    seconds = 21.448 - t * (46.8150 + t * (0.00059 - t * 0.001813))
+    e0 = 23 + (26 + seconds / 60) / 60
+    obliq = e0 + 0.00256 * math.cos(math.radians(omega))
+
+    decl = math.degrees(
+        math.asin(math.sin(math.radians(obliq)) * math.sin(math.radians(lambda_sun)))
+    )
+
+    y = math.tan(math.radians(obliq / 2)) ** 2
+    l0_rad = math.radians(l0)
+    eot = 4 * math.degrees(
+        y * math.sin(2 * l0_rad)
+        - 2 * e * math.sin(m_rad)
+        + 4 * e * y * math.sin(m_rad) * math.cos(2 * l0_rad)
+        - 0.5 * y * y * math.sin(4 * l0_rad)
+        - 1.25 * e * e * math.sin(2 * m_rad)
+    )  # equation of time, minutes
+
+    minutes_utc = when_utc.hour * 60 + when_utc.minute + when_utc.second / 60
+    true_solar_time = (minutes_utc + eot + 4 * lon_deg) % 1440
+    ha = true_solar_time / 4 - 180  # hour angle, deg
+
+    lat_rad = math.radians(lat_deg)
+    decl_rad = math.radians(decl)
+    ha_rad = math.radians(ha)
+
+    cos_zenith = (
+        math.sin(lat_rad) * math.sin(decl_rad)
+        + math.cos(lat_rad) * math.cos(decl_rad) * math.cos(ha_rad)
+    )
+    cos_zenith = max(-1.0, min(1.0, cos_zenith))
+    zenith = math.degrees(math.acos(cos_zenith))
+    altitude = 90 - zenith
+
+    denom = math.cos(lat_rad) * math.sin(math.radians(zenith))
+    if abs(denom) > 1e-9:
+        az_cos = (math.sin(lat_rad) * cos_zenith - math.sin(decl_rad)) / denom
+        az_cos = max(-1.0, min(1.0, az_cos))
+        azimuth = math.degrees(math.acos(az_cos))
+        azimuth = (azimuth + 180) % 360 if ha > 0 else (540 - azimuth) % 360
+    else:
+        azimuth = 180.0 if lat_deg > decl else 0.0
+
+    if apply_refraction:
+        altitude += refraction(altitude)
+
+    return altitude, azimuth % 360
+
+
+# ── calibration ───────────────────────────────────────────────────────────────
+def _wrap180(angle: float) -> float:
+    """Wrap an angle to the (-180, 180] range."""
+    return (angle + 180) % 360 - 180
+
+
+def _circular_mean(degrees_list: list[float]) -> float:
+    """Mean of angles in degrees, handling the 0/360 wrap; result in [0, 360)."""
+    s = sum(math.sin(math.radians(d)) for d in degrees_list)
+    c = sum(math.cos(math.radians(d)) for d in degrees_list)
+    return math.degrees(math.atan2(s, c)) % 360
+
+
+@dataclass
+class Calibration:
+    """Fixed mounting offset between the IMU angles and the sky.
+
+    ``alt_offset`` is added to the IMU pitch to give true altitude.
+    ``az_offset`` is added to the IMU yaw to give true azimuth. Offsets are a
+    single-point fit (``true = raw + offset``); they assume the IMU axis moves
+    the same direction and scale as the telescope, which holds for a rigidly
+    strapped-on sensor. Azimuth is only meaningful if the sensor outputs an
+    absolute heading (9-DOF / magnetometer mode).
+    """
+
+    alt_offset: float
+    az_offset: float
+    reference: str = "sun"
+    sun_alt: float | None = None
+    sun_az: float | None = None
+    imu_pitch: float | None = None
+    imu_yaw: float | None = None
+    samples: int = 0
+    timestamp: str = ""
+
+    def apply(self, sample: "SensorData") -> tuple[float, float]:
+        """Return ``(altitude, azimuth)`` for a sample, corrected by the offsets."""
+        altitude = sample.angle.y + self.alt_offset
+        azimuth = (sample.angle.z + self.az_offset) % 360
+        return altitude, azimuth
+
+    def save(self, path: Path) -> None:
+        path.write_text(json.dumps(asdict(self), indent=2))
+
+    @classmethod
+    def load(cls, path: Path) -> "Calibration":
+        data = json.loads(Path(path).read_text())
+        return cls(**data)
+
+
+def compute_sun_calibration(pitches: list[float], yaws: list[float],
+                            sun_alt: float, sun_az: float) -> Calibration:
+    """Build a Calibration from averaged IMU samples and the true Sun position."""
+    mean_pitch = sum(pitches) / len(pitches)
+    mean_yaw = _circular_mean(yaws)
+    return Calibration(
+        alt_offset=sun_alt - mean_pitch,
+        az_offset=_wrap180(sun_az - mean_yaw),
+        reference="sun",
+        sun_alt=round(sun_alt, 4),
+        sun_az=round(sun_az, 4),
+        imu_pitch=round(mean_pitch, 4),
+        imu_yaw=round(mean_yaw, 4),
+        samples=len(pitches),
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
 
 
@@ -277,12 +467,46 @@ async def _cmd_scan(args) -> int:
     return 0
 
 
+def _load_calibration(args) -> "Calibration | None":
+    path = Path(args.calibration_file)
+    if not path.exists():
+        return None
+    try:
+        cal = Calibration.load(path)
+        log.info(
+            "Loaded calibration from %s (alt_offset=%.2f° az_offset=%.2f°)",
+            path, cal.alt_offset, cal.az_offset,
+        )
+        return cal
+    except Exception as exc:  # noqa: BLE001 - bad/old file, just skip it
+        log.warning("Could not read calibration %s: %s", path, exc)
+        return None
+
+
+async def _sample_average(imu: "WitIMU", latest: dict, duration: float):
+    """Collect pitch/yaw samples for ``duration`` seconds; return the two lists."""
+    pitches: list[float] = []
+    yaws: list[float] = []
+    deadline = asyncio.get_running_loop().time() + duration
+    last_id = None
+    while asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.05)
+        sample = latest.get("sample")
+        if sample is None or id(sample) == last_id:
+            continue
+        last_id = id(sample)
+        pitches.append(sample.angle.y)
+        yaws.append(sample.angle.z)
+    return pitches, yaws
+
+
 async def _cmd_read(args) -> int:
-    loop = asyncio.get_running_loop()
     latest: dict[str, SensorData] = {}
 
     def on_data(sample: SensorData) -> None:
         latest["sample"] = sample
+
+    calibration = _load_calibration(args)
 
     imu = WitIMU(on_data=on_data)
     try:
@@ -306,7 +530,10 @@ async def _cmd_read(args) -> int:
                 f"altitude(pitch Y): {sample.angle.y:7.2f}°   "
                 f"roll(X): {sample.angle.x:7.2f}°   yaw(Z): {sample.angle.z:7.2f}°"
             )
-            if args.latitude is not None:
+            if calibration is not None:
+                alt, az = calibration.apply(sample)
+                line += f"   →  corrected alt: {alt:7.2f}°  az: {az:7.2f}°"
+            elif args.latitude is not None:
                 delta = sample.angle.y - args.latitude
                 line += f"   Δlat: {delta:+6.2f}°"
             print("\r" + line + "  ", end="", flush=True)
@@ -314,6 +541,73 @@ async def _cmd_read(args) -> int:
         print()
     finally:
         await imu.disconnect()
+    return 0
+
+
+async def _cmd_calibrate_sun(args) -> int:
+    """Calibrate the IMU offset against the Sun.
+
+    Point the Dwarf at the Sun (solar tracking) with the IMU strapped on, then
+    run this. The true Sun altitude/azimuth (from ephemeris, or --sun-alt/--sun-az)
+    minus the averaged IMU reading gives the mounting offset, saved to disk.
+    """
+    if args.sun_alt is not None and args.sun_az is not None:
+        sun_alt, sun_az = args.sun_alt, args.sun_az
+        log.info("Using supplied Sun position: alt=%.3f° az=%.3f°", sun_alt, sun_az)
+    else:
+        if args.lat is None or args.lon is None:
+            log.error(
+                "Sun calibration needs --lat and --lon (or --sun-alt and --sun-az)."
+            )
+            return 2
+        sun_alt, sun_az = sun_altaz(
+            args.lat, args.lon, apply_refraction=not args.no_refraction
+        )
+        log.info(
+            "Computed Sun position now: alt=%.3f° az=%.3f° (lat=%.4f lon=%.4f)",
+            sun_alt, sun_az, args.lat, args.lon,
+        )
+
+    if sun_alt < 0:
+        log.error("The Sun is below the horizon (alt=%.2f°) — cannot calibrate.", sun_alt)
+        return 1
+
+    latest: dict[str, SensorData] = {}
+
+    def on_data(sample: SensorData) -> None:
+        latest["sample"] = sample
+
+    imu = WitIMU(on_data=on_data)
+    try:
+        await imu.connect(address=args.address, name=args.name, timeout=args.timeout)
+    except Exception as exc:  # noqa: BLE001 - surface a clean CLI error
+        log.error("%s", exc)
+        return 1
+
+    try:
+        log.info("Collecting IMU samples for %.0fs — keep the mount tracking the Sun...",
+                 args.duration)
+        pitches, yaws = await _sample_average(imu, latest, args.duration)
+    finally:
+        await imu.disconnect()
+
+    if not pitches:
+        log.error("No IMU data received during calibration.")
+        return 1
+
+    cal = compute_sun_calibration(pitches, yaws, sun_alt, sun_az)
+    path = Path(args.calibration_file)
+    cal.save(path)
+
+    print()
+    print(f"  Samples averaged : {cal.samples}")
+    print(f"  Sun (reference)  : alt {cal.sun_alt:.3f}°   az {cal.sun_az:.3f}°")
+    print(f"  IMU (raw mean)   : pitch {cal.imu_pitch:.3f}°   yaw {cal.imu_yaw:.3f}°")
+    print(f"  Altitude offset  : {cal.alt_offset:+.3f}°")
+    print(f"  Azimuth offset   : {cal.az_offset:+.3f}°  "
+          f"(only valid in 9-DOF/absolute-heading mode)")
+    print(f"  Saved to         : {path}")
+    print("\nRun 'python3 wit_imu.py' to see corrected alt/az using this calibration.")
     return 0
 
 
@@ -325,6 +619,11 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--scan", action="store_true",
         help="List nearby BLE devices and exit (find the sensor's name/address)",
+    )
+    parser.add_argument(
+        "--calibrate-sun", action="store_true",
+        help="Calibrate the IMU offset against the Sun (point the mount at the "
+             "Sun first), then save it to the calibration file",
     )
     parser.add_argument(
         "--address", default=None, metavar="ADDR",
@@ -341,12 +640,45 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--latitude", type=float, default=None, metavar="DEG",
-        help="Observer latitude; shows Δlat = pitch − latitude for polar alignment",
+        help="Observer latitude; shows Δlat = pitch − latitude for polar alignment "
+             "(read mode, when no calibration file is present)",
     )
     parser.add_argument(
         "--timeout", type=float, default=8.0, metavar="SEC",
         help="Scan/connect timeout in seconds",
     )
+
+    cal_group = parser.add_argument_group("Sun calibration (--calibrate-sun)")
+    cal_group.add_argument(
+        "--lat", type=float, default=None, metavar="DEG",
+        help="Observer latitude for computing the Sun's position",
+    )
+    cal_group.add_argument(
+        "--lon", type=float, default=None, metavar="DEG",
+        help="Observer longitude (east-positive) for computing the Sun's position",
+    )
+    cal_group.add_argument(
+        "--sun-alt", type=float, default=None, metavar="DEG",
+        help="Override the reference Sun altitude instead of computing it "
+             "(e.g. from the Dwarf's own report)",
+    )
+    cal_group.add_argument(
+        "--sun-az", type=float, default=None, metavar="DEG",
+        help="Override the reference Sun azimuth instead of computing it",
+    )
+    cal_group.add_argument(
+        "--duration", type=float, default=5.0, metavar="SEC",
+        help="How long to average IMU samples during calibration",
+    )
+    cal_group.add_argument(
+        "--no-refraction", action="store_true",
+        help="Do not add atmospheric refraction to the computed Sun altitude",
+    )
+    parser.add_argument(
+        "--calibration-file", default="wit_calibration.json", metavar="PATH",
+        help="Where the Sun calibration is saved/loaded",
+    )
+
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging",
     )
@@ -357,7 +689,12 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
-    coro = _cmd_scan(args) if args.scan else _cmd_read(args)
+    if args.scan:
+        coro = _cmd_scan(args)
+    elif args.calibrate_sun:
+        coro = _cmd_calibrate_sun(args)
+    else:
+        coro = _cmd_read(args)
     try:
         return asyncio.run(coro)
     except KeyboardInterrupt:
