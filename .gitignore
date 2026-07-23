@@ -21,3 +21,6 @@ test_grab.py
 
 # Runtime logs
 *.log
+
+# skyfield ephemeris cache (downloaded on first use, ~17MB)
+.skyfield_cache/

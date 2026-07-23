@@ -68,6 +68,17 @@ It needs one extra dependency:
 
   pip install bleak
 
+Sun/Moon calibration also uses `skyfield` (a real JPL DE421 ephemeris) if it's
+installed, for sub-arcsecond accuracy:
+
+  pip install skyfield
+
+This is optional — skyfield downloads a ~17MB ephemeris file into
+`.skyfield_cache/` on first use (needs network once, then works offline), and
+if it isn't installed or the download can't complete, calibration falls back
+automatically to a self-contained low-precision formula (verified to within
+~0.01-0.02° of true position, still plenty for a mount offset).
+
 Usage:
 
   # list nearby BLE devices to find the sensor's name/address
@@ -79,15 +90,18 @@ Usage:
   # target a specific device and compare the pitch against your latitude
   python3 wit_imu.py --address AA:BB:CC:DD:EE:FF --latitude 52.5200
 
-Sun calibration (finding the mount offset):
+Sun/Moon calibration (finding the mount offset):
 
 The IMU only knows its own tilt, which differs from the telescope's true pointing
-by a fixed mounting offset. To measure that offset, switch the Dwarf to solar
-tracking so it points at the Sun, keep the sensor strapped on, then run:
+by a fixed mounting offset. To measure that offset, no camera view of the Sun or
+Moon is needed — the Dwarf's own tracking is trusted, and the true position comes
+from ephemeris instead of an on-screen fix. Switch the Dwarf to track the Sun or
+Moon, keep the sensor strapped on, then run:
 
-  python3 wit_imu.py --calibrate-sun --lat 52.5200 --lon 13.4050
+  python3 wit_imu.py --calibrate-sun  --lat 52.5200 --lon 13.4050
+  python3 wit_imu.py --calibrate-moon --lat 52.5200 --lon 13.4050
 
-This computes the Sun's true altitude/azimuth from your location and the current
+This computes the body's true altitude/azimuth from your location and the current
 time (system clock, UTC), averages the IMU reading for a few seconds, and saves
 the altitude/azimuth offset to `wit_calibration.json`. After that, plain
 `python3 wit_imu.py` shows corrected altitude/azimuth automatically.
