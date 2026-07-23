@@ -42,12 +42,15 @@ try:
 except Exception:  # pragma: no cover - standalone fallback
     CMD_NAMES = {
         10050: "V3_CAMERA_TELE_OPEN_CAMERA", 12036: "V3_CAMERA_WIDE_OPEN_CAMERA",
-        11002: "ASTRO_START_GOTO_DSO", 11013: "ASTRO_START_ONE_CLICK_GOTO_DSO",
+        11002: "ASTRO_START_GOTO_DSO", 11003: "ASTRO_START_GOTO_SOLAR_SYSTEM",
+        11013: "ASTRO_START_ONE_CLICK_GOTO_DSO",
+        11014: "ASTRO_START_ONE_CLICK_GOTO_SOLAR_SYSTEM",
         13010: "SYSTEM_SET_LOCATION", 14006: "STEP_MOTOR_JOYSTICK",
         14800: "TRACK_START_TRACK", 14801: "TRACK_STOP_TRACK",
         15201: "NOTIFY_ELE", 15203: "NOTIFY_TEMPERATURES",
         15211: "NOTIFY_STATE_ASTRO_GOTO", 15212: "NOTIFY_STATE_ASTRO_TRACKING",
-        15225: "NOTIFY_TRACK_RESULT", 15252: "NOTIFY_WIDE_TRACK_RESULT",
+        15225: "NOTIFY_TRACK_RESULT", 15233: "NOTIFY_ASTRO_TARGET_STATUS",
+        15252: "NOTIFY_WIDE_TRACK_RESULT",
         15284: "NOTIFY_WIDE_TRACK_STATE",
     }
 
@@ -135,6 +138,12 @@ NESTED_SCHEMAS: dict[str, list[Field]] = {
     "mode_switch":   [(1, "mode", "int")],
     "mot_object":    [(1, "id", "int"), (2, "x", "sint"), (3, "y", "sint"),
                       (4, "w", "int"),  (5, "h", "int"), (6, "cls", "int")],
+    # target echoed back inside the 11003 goto-solar-system ACK; same 4 fields as the
+    # front of an 11014 request, minus its trailing `mode` — see SCHEMAS[11003/11014].
+    "solar_target":  [(1, "solar_id", "int"), (2, "coord1", "double"),
+                      (3, "coord2", "double"), (4, "name", "str")],
+    # nested inside NOTIFY_ASTRO_TARGET_STATUS (15233) — see SCHEMAS[15233].
+    "target_status": [(1, "state", "int"), (2, "name", "str")],
 }
 
 # cmd id -> payload schema.  Requests (phone -> device) and notifies (device ->
@@ -148,6 +157,14 @@ SCHEMAS: dict[int, list[Field]] = {
             (3, "name", "str"), (4, "goto_only", "bool")],  # ReqGotoDSO
     11013: [(1, "ra", "double"), (2, "dec", "double"),
             (3, "name", "str"), (4, "goto_only", "bool")],  # one-click goto
+    # CAPTURE-VERIFIED 2026-07-23: ASTRO_START_ONE_CLICK_GOTO_SOLAR_SYSTEM request, seen
+    # sent phone->device with {solar_id:8, coord1:29.036198, coord2:41.08766, name:"Moon",
+    # mode:9}; `confirm` (f6) only showed up on a second send once the app reported
+    # steady tracking. coord1/coord2 are doubles but whether they're ra/dec or alt/az
+    # (or something else) isn't confirmed yet — named neutrally until cross-checked
+    # against a known target's ephemeris.
+    11014: [(1, "solar_id", "int"), (2, "coord1", "double"), (3, "coord2", "double"),
+            (4, "name", "str"), (5, "mode", "int"), (6, "confirm", "bool")],
     13004: [(1, "lock", "bool")],                           # ReqSetMasterLock
     13010: [(1, "lat", "double"), (2, "lon", "double"),
             (3, "alt", "double")],                          # ReqSetLocation
@@ -159,7 +176,16 @@ SCHEMAS: dict[int, list[Field]] = {
     14805: [(1, "id", "int")],                              # lock tele detection
     16404: [(3, "config", ("msg", "mode_switch"))],         # V3 mode switch {3:{1:m}}
 
-    # ── notifies (device -> phone) ──────────────────────────────────────────────
+    # ── notifies / acks (device -> phone) ───────────────────────────────────────
+    # CAPTURE-VERIFIED 2026-07-23: only ever observed as an ACK (device->phone), echoing
+    # the target set by the 11014 one-click-solar-system request: {status:-11531,
+    # target:{solar_id:8, coord1:29.036198, coord2:41.08766, name:"Moon"}}. `status`'s
+    # meaning is unconfirmed (not a small sentinel like the -100 "no target" code
+    # elsewhere). dwarflab_controller.goto_solar() models a plain-int REQUEST for this
+    # cmd id (bare field 1 = solar-system index) that this capture never sent — if that
+    # path gets captured, its payload will NOT match this schema and needs a fork by
+    # direction/type, not a blind merge.
+    11003: [(1, "status", "sint"), (2, "target", ("msg", "solar_target"))],
     15201: [(1, "battery", "int")],
     15202: [(1, "battery", "int")],
     15203: [(1, "temp", "px10"), (2, "cmos_temp", "px10")],
@@ -167,6 +193,12 @@ SCHEMAS: dict[int, list[Field]] = {
     15212: [(1, "tracking", "bool")],
     15225: [(1, "x", "sint"), (2, "y", "sint"), (3, "w", "int"), (4, "h", "int")],
     15232: [(1, "x", "sint"), (2, "y", "sint"), (3, "w", "int"), (4, "h", "int")],
+    # CAPTURE-VERIFIED 2026-07-23: nested at field 3 only, {1:state, 2:name}. `state` was
+    # 3 immediately after an ASTRO_START_ONE_CLICK_GOTO_SOLAR_SYSTEM request, then 1 once
+    # the app reported the mount was steadily tracking — 2 real samples, not enough to
+    # build a confident enum (and it does NOT reuse _GOTO_STATE's numbering, which would
+    # put 3 = already-tracking on the first sample).
+    15233: [(3, "target", ("msg", "target_status"))],
     15252: [(1, "x", "sint"), (2, "y", "sint"), (3, "w", "int"), (4, "h", "int")],
     15238: [(1, "objects", ("repeated", ("msg", "mot_object")))],
     15251: [(1, "objects", ("repeated", ("msg", "mot_object")))],
@@ -368,7 +400,13 @@ def decode_wscmd(raw: bytes) -> dict:
                 elif fn == 8:
                     env[8] = seg.decode("utf-8", "replace")
                 else:
-                    env[fn] = seg
+                    # Envelope field we don't model, or a mis-parsed frame (e.g. a
+                    # truncated capture — pkt-size 512 — splitting a WS frame across
+                    # packets misaligns the reassembly). CAPTURE-VERIFIED: this has
+                    # produced garbage where `fn` collided with major(1)/client_id(8),
+                    # leaving a raw `bytes` in `result` that crashes json.dumps downstream.
+                    env[fn] = (seg.decode("utf-8") if looks_like_utf8_text(seg)
+                               else seg.hex(" "))
             elif wt == 1:
                 i += 8
             elif wt == 5:

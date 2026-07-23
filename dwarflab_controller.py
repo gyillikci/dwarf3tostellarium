@@ -99,7 +99,12 @@ CMD_ASTRO_STOP_GOTO                      = 11004
 CMD_ASTRO_START_CAPTURE_RAW_LIVE_STACKING = 11005
 CMD_ASTRO_STOP_CAPTURE_RAW_LIVE_STACKING  = 11006
 CMD_ASTRO_GO_LIVE                        = 11010
+# CAPTURE-VERIFIED 2026-07-23: mirrors 11013 the way 11003 mirrors 11002 (DSO cmd,
+# solar-system cmd = +1). Request payload {1:solar_id, 2:coord1(double), 3:coord2(double),
+# 4:name, 5:mode, 6:confirm(bool)}; observed with solar_id=8, name="Moon", mode=9,
+# confirm=true on a follow-up sent once tracking had settled.
 CMD_ASTRO_START_ONE_CLICK_GOTO_DSO       = 11013
+CMD_ASTRO_START_ONE_CLICK_GOTO_SOLAR_SYSTEM = 11014
 CMD_ASTRO_STOP_ONE_CLICK_GOTO            = 11015
 CMD_ASTRO_START_WIDE_CAPTURE_LIVE_STACKING = 11016
 CMD_ASTRO_STOP_WIDE_CAPTURE_LIVE_STACKING  = 11017
@@ -189,6 +194,11 @@ CMD_NOTIFY_STATE_ASTRO_TRACKING          = 15212
 CMD_NOTIFY_TRACK_RESULT                  = 15225  # tele single-target box {x,y,w,h}
 CMD_NOTIFY_SENTRY_MODE_STATE             = 15231  # sentinel/UFO state machine code
 CMD_NOTIFY_SENTRY_MODE_TRACK_RESULT      = 15232  # sentinel-mode box {x,y,w,h}
+# CAPTURE-VERIFIED 2026-07-23: nested at field 3, {1:state, 2:name}; state seen as 3 right
+# after an ASTRO_START_ONE_CLICK_GOTO_SOLAR_SYSTEM request, then 1 once the app reported
+# steady-state tracking — exact enum meaning still unconfirmed, but the transition matches
+# goto -> tracking.
+CMD_NOTIFY_ASTRO_TARGET_STATUS           = 15233
 CMD_NOTIFY_MULTI_TRACK_RESULT            = 15238  # tele multi-box (nested repeated)
 CMD_NOTIFY_UFO_MODE_STATE                = 15240  # sentinel-UFO mode state
 CMD_NOTIFY_WIDE_MULTI_TRACK_RESULT       = 15251  # wide multi-box (nested repeated)
