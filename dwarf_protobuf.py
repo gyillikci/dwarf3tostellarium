@@ -175,6 +175,18 @@ SCHEMAS: dict[int, list[Field]] = {
     14808: [(1, "id", "int")],                              # lock wide detection
     14805: [(1, "id", "int")],                              # lock tele detection
     16404: [(3, "config", ("msg", "mode_switch"))],         # V3 mode switch {3:{1:m}}
+    # CAPTURE-VERIFIED 2026-07-23: FOCUS_MANUAL_SINGLE_STEP / START|STOP_MANUAL_CONTINUOUS
+    # / START_ASTRO_AUTO_FOCUS all sent with a genuinely EMPTY data payload across many
+    # samples (72 single-steps, several start/stop pairs, several auto-focus triggers) —
+    # bare triggers, not a repo gap. This CONTRADICTS dwarflab_controller's model, whose
+    # focus_step(s)/focus_in()/focus_out() build a signed p_int payload for direction —
+    # that field was never observed on the wire, so either the app no longer parameterizes
+    # direction this way, or it's carried by a different mechanism entirely (a prior
+    # command, session state, or a separate cmd id per direction we haven't captured).
+    15001: [],                                              # FOCUS_MANUAL_SINGLE_STEP
+    15002: [],                                              # FOCUS_START_MANUAL_CONTINUOUS
+    15003: [],                                              # FOCUS_STOP_MANUAL_CONTINUOUS
+    15004: [],                                              # FOCUS_START_ASTRO_AUTO_FOCUS
 
     # ── notifies / acks (device -> phone) ───────────────────────────────────────
     # CAPTURE-VERIFIED 2026-07-23: only ever observed as an ACK (device->phone), echoing
