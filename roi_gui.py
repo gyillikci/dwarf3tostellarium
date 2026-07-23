@@ -36,8 +36,22 @@ from tkinter import ttk
 
 import numpy as np
 
-# OpenCV must be told to use TCP for RTSP *before* the first VideoCapture call.
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+# OpenCV/FFmpeg RTSP options, set *before* the first VideoCapture call.
+# Beyond forcing TCP transport, these trim the FFmpeg-side buffering that adds
+# most of the glass-to-glass latency on the Dwarf's H.265 stream:
+#   fflags;nobuffer + flags;low_delay  -> don't hold frames, decode ASAP
+#   max_delay;0 + reorder_queue_size;0 -> no reorder/jitter buffering
+#   probesize;32 + analyzeduration;0   -> minimal stream probing at open
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp"
+    "|fflags;nobuffer"
+    "|flags;low_delay"
+    "|max_delay;0"
+    "|reorder_queue_size;0"
+    "|probesize;32"
+    "|analyzeduration;0",
+)
 
 import cv2  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
