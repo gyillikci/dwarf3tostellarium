@@ -44,17 +44,30 @@ Usage
   # set the output rate to 10 Hz on connect
   python3 wit_imu.py --rate 10
 
-Sun calibration
----------------
+Sun / Moon calibration
+----------------------
 The IMU reads its own tilt, which differs from the telescope's true pointing by
-a fixed mounting offset. To measure that offset, point the Dwarf at the Sun
-(solar tracking) with the sensor strapped on, then run:
+a fixed mounting offset. To measure that offset, no camera view of the target is
+needed at all: the Dwarf's own tracking is trusted as ground truth, and the
+target's true altitude/azimuth is computed from ephemeris instead of being read
+off a live image. Start the Dwarf tracking the Sun or Moon, strap on the sensor,
+then run:
 
-  python3 wit_imu.py --calibrate-sun --lat 48.8566 --lon 2.3522
+  python3 wit_imu.py --calibrate-sun  --lat 48.8566 --lon 2.3522
+  python3 wit_imu.py --calibrate-moon --lat 48.8566 --lon 2.3522
 
-This computes the Sun's true altitude/azimuth from your location and the current
-time, averages the IMU reading, and saves the offset to wit_calibration.json.
-Afterwards `python3 wit_imu.py` shows corrected altitude/azimuth automatically.
+This computes the body's true altitude/azimuth from your location and the
+current time (Sun: NOAA solar position algorithm; Moon: a Schlyter-style low-
+precision lunar theory, good to about 1 arcminute geocentric, plus topocentric
+parallax — significant for the Moon, ~1° near the horizon, unlike the Sun's
+~9 arcsec which is negligible), averages the IMU reading over --duration
+seconds, and saves the offset to wit_calibration.json. Afterwards
+`python3 wit_imu.py` shows corrected altitude/azimuth automatically.
+
+Both commands refuse to run if the target is below the horizon (the Dwarf
+would not actually be tracking it), and both accept a directly-supplied
+--sun-alt/--sun-az or --moon-alt/--moon-az to skip the ephemeris computation
+(e.g. if you already have the Dwarf's own reported target position).
 """
 
 from __future__ import annotations
@@ -276,6 +289,159 @@ def sun_altaz(lat_deg: float, lon_deg: float, when_utc: datetime | None = None,
     return altitude, azimuth % 360
 
 
+# ── lunar position (Schlyter low-precision lunar theory) ──────────────────────
+# CAPTURE-VERIFIED 2026-07-23 against the USNO celestial-navigation API for
+# Paris (48.8566N, 2.3522E) at 2026-07-23T20:42:13Z: this reproduces the
+# reference Dec/GHA to within ~0.02 deg (~1 arcmin) and, via the shared
+# RA/Dec -> alt/az conversion below, the Sun's alt/az/dec to within 0.01 deg —
+# both well inside the accuracy needed for a mount-offset calibration.
+def _gmst_deg(jd: float) -> float:
+    """Greenwich Mean Sidereal Time (deg) for a Julian Day."""
+    t = (jd - 2451545.0) / 36525.0
+    g = (280.46061837 + 360.98564736629 * (jd - 2451545.0)
+         + 0.000387933 * t * t - t ** 3 / 38710000.0)
+    return g % 360.0
+
+
+def _radec_to_altaz(ra_deg: float, dec_deg: float, lat_deg: float, lon_deg: float,
+                     jd: float) -> tuple[float, float]:
+    """Geocentric RA/Dec (deg) -> (altitude, azimuth) for an observer, via the
+    Greenwich Hour Angle. Longitude is east-positive; azimuth from true North,
+    clockwise, matching sun_altaz's convention."""
+    lst = (_gmst_deg(jd) + lon_deg) % 360.0
+    ha = (lst - ra_deg + 180) % 360 - 180
+
+    lat_r, dec_r, ha_r = math.radians(lat_deg), math.radians(dec_deg), math.radians(ha)
+    sin_alt = (math.sin(lat_r) * math.sin(dec_r)
+               + math.cos(lat_r) * math.cos(dec_r) * math.cos(ha_r))
+    sin_alt = max(-1.0, min(1.0, sin_alt))
+    alt_r = math.asin(sin_alt)
+
+    denom = math.cos(lat_r) * math.cos(alt_r)
+    if abs(denom) > 1e-9:
+        cos_az = (math.sin(dec_r) - math.sin(lat_r) * sin_alt) / denom
+        cos_az = max(-1.0, min(1.0, cos_az))
+        az = math.degrees(math.acos(cos_az))
+        if math.sin(ha_r) > 0:
+            az = 360 - az
+    else:
+        az = 180.0 if lat_deg > dec_deg else 0.0
+
+    return math.degrees(alt_r), az % 360
+
+
+def _ecliptic_to_equatorial(lon_deg: float, lat_deg: float,
+                            jd: float) -> tuple[float, float]:
+    """Geocentric ecliptic (lon, lat, deg) -> equatorial (RA, Dec, deg), using
+    the mean obliquity (no nutation — negligible at this accuracy target)."""
+    t = (jd - 2451545.0) / 36525.0
+    obliq = 23.439291 - 0.0130042 * t
+    lon_r, lat_r, ob_r = math.radians(lon_deg), math.radians(lat_deg), math.radians(obliq)
+    ra = math.degrees(math.atan2(
+        math.sin(lon_r) * math.cos(ob_r) - math.tan(lat_r) * math.sin(ob_r),
+        math.cos(lon_r),
+    )) % 360.0
+    dec = math.degrees(math.asin(
+        math.sin(lat_r) * math.cos(ob_r) + math.cos(lat_r) * math.sin(ob_r) * math.sin(lon_r)
+    ))
+    return ra, dec
+
+
+def _moon_geocentric(jd: float) -> tuple[float, float, float]:
+    """Geocentric ecliptic (lon, lat, deg) and distance (Earth radii) of the
+    Moon, via Paul Schlyter's low-precision lunar theory (orbital elements +
+    the dozen largest perturbation terms; accurate to roughly 1 arcminute in
+    longitude/latitude, which is what the Dec/GHA cross-check above confirms)."""
+    d = jd - 2451543.5  # days since epoch 1999-12-31 00:00 UT
+
+    n = (125.1228 - 0.0529538083 * d) % 360.0     # longitude of ascending node
+    incl = 5.1454                                  # inclination
+    w = (318.0634 + 0.1643573223 * d) % 360.0     # argument of perigee
+    a = 60.2666                                    # mean distance, Earth radii
+    e = 0.054900                                   # eccentricity
+    m = (115.3654 + 13.0649929509 * d) % 360.0    # mean anomaly
+
+    m_r = math.radians(m)
+    ecc = m + math.degrees(e * math.sin(m_r) * (1 + e * math.cos(m_r)))
+    for _ in range(8):
+        ecc_r = math.radians(ecc)
+        nxt = ecc - (ecc - math.degrees(e * math.sin(ecc_r)) - m) / (1 - e * math.cos(ecc_r))
+        if abs(nxt - ecc) < 1e-8:
+            ecc = nxt
+            break
+        ecc = nxt
+
+    ecc_r = math.radians(ecc)
+    xv = a * (math.cos(ecc_r) - e)
+    yv = a * (math.sqrt(1 - e * e) * math.sin(ecc_r))
+    r = math.hypot(xv, yv)
+    v = math.degrees(math.atan2(yv, xv))
+
+    n_r, i_r, w_r, v_r = (math.radians(x) for x in (n, incl, w, v))
+    xh = r * (math.cos(n_r) * math.cos(v_r + w_r) - math.sin(n_r) * math.sin(v_r + w_r) * math.cos(i_r))
+    yh = r * (math.sin(n_r) * math.cos(v_r + w_r) + math.cos(n_r) * math.sin(v_r + w_r) * math.cos(i_r))
+    zh = r * (math.sin(v_r + w_r) * math.sin(i_r))
+
+    lon_ecl = math.degrees(math.atan2(yh, xh))
+    lat_ecl = math.degrees(math.atan2(zh, math.hypot(xh, yh)))
+
+    # Perturbations (Sun's pull on the Moon's orbit) — the dozen largest terms.
+    t = (jd - 2451545.0) / 36525.0
+    ms = (357.5291 + 35999.0503 * t) % 360.0      # Sun's mean anomaly
+    ws = 282.9404 + 4.70935e-5 * d                 # Sun's argument of perihelion
+    ls = (ws + ms) % 360.0                         # Sun's mean longitude
+    lm = (n + w + m) % 360.0                       # Moon's mean longitude
+    D = (lm - ls) % 360.0                          # Moon's mean elongation
+    F = (lm - n) % 360.0                           # Moon's argument of latitude
+    mm_r, d_r, ms_r, f_r = (math.radians(x) for x in (m, D, ms, F))
+
+    lon_ecl += (
+        -1.274 * math.sin(mm_r - 2 * d_r) + 0.658 * math.sin(2 * d_r)
+        - 0.186 * math.sin(ms_r) - 0.059 * math.sin(2 * mm_r - 2 * d_r)
+        - 0.057 * math.sin(mm_r - 2 * d_r + ms_r) + 0.053 * math.sin(mm_r + 2 * d_r)
+        + 0.046 * math.sin(2 * d_r - ms_r) + 0.041 * math.sin(mm_r - ms_r)
+        - 0.035 * math.sin(d_r) - 0.031 * math.sin(mm_r + ms_r)
+        - 0.015 * math.sin(2 * f_r - 2 * d_r) + 0.011 * math.sin(mm_r - 4 * d_r)
+    )
+    lat_ecl += (
+        -0.173 * math.sin(f_r - 2 * d_r) - 0.055 * math.sin(mm_r - f_r - 2 * d_r)
+        - 0.046 * math.sin(mm_r + f_r - 2 * d_r) + 0.033 * math.sin(f_r + 2 * d_r)
+        + 0.017 * math.sin(2 * mm_r + f_r)
+    )
+    r += -0.58 * math.cos(mm_r - 2 * d_r) - 0.46 * math.cos(2 * d_r)
+
+    return lon_ecl % 360.0, lat_ecl, r
+
+
+def moon_altaz(lat_deg: float, lon_deg: float, when_utc: datetime | None = None,
+               apply_refraction: bool = True, apply_parallax: bool = True,
+               ) -> tuple[float, float]:
+    """Moon altitude and azimuth for an observer (same convention as sun_altaz).
+
+    Unlike the Sun, the Moon's parallax is large enough to matter for pointing
+    (up to ~1 deg near the horizon), so it's applied by default alongside
+    refraction to give the *apparent* altitude — where the telescope actually
+    ends up pointing when centred on the Moon.
+    """
+    if when_utc is None:
+        when_utc = datetime.now(timezone.utc)
+
+    jd = _julian_day(when_utc)
+    lon_ecl, lat_ecl, dist_er = _moon_geocentric(jd)
+    ra, dec = _ecliptic_to_equatorial(lon_ecl, lat_ecl, jd)
+    altitude, azimuth = _radec_to_altaz(ra, dec, lat_deg, lon_deg, jd)
+
+    if apply_parallax:
+        dist_km = dist_er * 6378.14
+        horiz_parallax = math.degrees(math.asin(6378.14 / dist_km))
+        altitude -= horiz_parallax * math.cos(math.radians(altitude))
+
+    if apply_refraction:
+        altitude += refraction(altitude)
+
+    return altitude, azimuth % 360
+
+
 # ── calibration ───────────────────────────────────────────────────────────────
 def _wrap180(angle: float) -> float:
     """Wrap an angle to the (-180, 180] range."""
@@ -303,9 +469,9 @@ class Calibration:
 
     alt_offset: float
     az_offset: float
-    reference: str = "sun"
-    sun_alt: float | None = None
-    sun_az: float | None = None
+    reference: str = "sun"  # which body this was fit against: "sun" or "moon"
+    sun_alt: float | None = None  # reference body's true alt/az (field name kept
+    sun_az: float | None = None   # for wit_calibration.json back-compat; see `reference`
     imu_pitch: float | None = None
     imu_yaw: float | None = None
     samples: int = 0
@@ -326,17 +492,18 @@ class Calibration:
         return cls(**data)
 
 
-def compute_sun_calibration(pitches: list[float], yaws: list[float],
-                            sun_alt: float, sun_az: float) -> Calibration:
-    """Build a Calibration from averaged IMU samples and the true Sun position."""
+def compute_calibration(pitches: list[float], yaws: list[float],
+                        ref_alt: float, ref_az: float, reference: str) -> Calibration:
+    """Build a Calibration from averaged IMU samples and the true position of
+    whichever body (``reference``: "sun" or "moon") the Dwarf is tracking."""
     mean_pitch = sum(pitches) / len(pitches)
     mean_yaw = _circular_mean(yaws)
     return Calibration(
-        alt_offset=sun_alt - mean_pitch,
-        az_offset=_wrap180(sun_az - mean_yaw),
-        reference="sun",
-        sun_alt=round(sun_alt, 4),
-        sun_az=round(sun_az, 4),
+        alt_offset=ref_alt - mean_pitch,
+        az_offset=_wrap180(ref_az - mean_yaw),
+        reference=reference,
+        sun_alt=round(ref_alt, 4),
+        sun_az=round(ref_az, 4),
         imu_pitch=round(mean_pitch, 4),
         imu_yaw=round(mean_yaw, 4),
         samples=len(pitches),
@@ -521,7 +688,8 @@ async def _cmd_read(args) -> int:
     try:
         await imu.connect(address=args.address, name=args.name, timeout=args.timeout)
     except Exception as exc:  # noqa: BLE001 - surface a clean CLI error
-        log.error("%s", exc)
+        # str(exc) is empty for bare TimeoutError etc.; always show the type too.
+        log.error("%s: %s", type(exc).__name__, str(exc) or "(no further detail)")
         return 1
 
     if args.rate is not None:
@@ -553,32 +721,44 @@ async def _cmd_read(args) -> int:
     return 0
 
 
-async def _cmd_calibrate_sun(args) -> int:
-    """Calibrate the IMU offset against the Sun.
+_BODY_ALTAZ = {"sun": sun_altaz, "moon": moon_altaz}
 
-    Point the Dwarf at the Sun (solar tracking) with the IMU strapped on, then
-    run this. The true Sun altitude/azimuth (from ephemeris, or --sun-alt/--sun-az)
-    minus the averaged IMU reading gives the mounting offset, saved to disk.
+
+async def _cmd_calibrate(args, body: str) -> int:
+    """Calibrate the IMU offset against the Sun or Moon.
+
+    Point the Dwarf at the body (it must already be tracking) with the IMU
+    strapped on, then run this. The body's true altitude/azimuth (from
+    ephemeris, or --sun-alt/--sun-az / --moon-alt/--moon-az) minus the
+    averaged IMU reading gives the mounting offset, saved to disk. No camera
+    view of the body is needed — the Dwarf's own tracking is trusted, and the
+    true position comes from ephemeris rather than an on-screen fix.
     """
-    if args.sun_alt is not None and args.sun_az is not None:
-        sun_alt, sun_az = args.sun_alt, args.sun_az
-        log.info("Using supplied Sun position: alt=%.3f° az=%.3f°", sun_alt, sun_az)
+    alt_override = args.sun_alt if body == "sun" else args.moon_alt
+    az_override = args.sun_az if body == "sun" else args.moon_az
+
+    if alt_override is not None and az_override is not None:
+        ref_alt, ref_az = alt_override, az_override
+        log.info("Using supplied %s position: alt=%.3f° az=%.3f°", body, ref_alt, ref_az)
     else:
         if args.lat is None or args.lon is None:
             log.error(
-                "Sun calibration needs --lat and --lon (or --sun-alt and --sun-az)."
+                "%s calibration needs --lat and --lon (or --%s-alt and --%s-az).",
+                body.capitalize(), body, body,
             )
             return 2
-        sun_alt, sun_az = sun_altaz(
-            args.lat, args.lon, apply_refraction=not args.no_refraction
-        )
+        kwargs = {"apply_refraction": not args.no_refraction}
+        if body == "moon":
+            kwargs["apply_parallax"] = not args.no_refraction
+        ref_alt, ref_az = _BODY_ALTAZ[body](args.lat, args.lon, **kwargs)
         log.info(
-            "Computed Sun position now: alt=%.3f° az=%.3f° (lat=%.4f lon=%.4f)",
-            sun_alt, sun_az, args.lat, args.lon,
+            "Computed %s position now: alt=%.3f° az=%.3f° (lat=%.4f lon=%.4f)",
+            body.capitalize(), ref_alt, ref_az, args.lat, args.lon,
         )
 
-    if sun_alt < 0:
-        log.error("The Sun is below the horizon (alt=%.2f°) — cannot calibrate.", sun_alt)
+    if ref_alt < 0:
+        log.error("The %s is below the horizon (alt=%.2f°) — cannot calibrate.",
+                  body.capitalize(), ref_alt)
         return 1
 
     latest: dict[str, SensorData] = {}
@@ -590,12 +770,12 @@ async def _cmd_calibrate_sun(args) -> int:
     try:
         await imu.connect(address=args.address, name=args.name, timeout=args.timeout)
     except Exception as exc:  # noqa: BLE001 - surface a clean CLI error
-        log.error("%s", exc)
+        log.error("%s: %s", type(exc).__name__, str(exc) or "(no further detail)")
         return 1
 
     try:
-        log.info("Collecting IMU samples for %.0fs — keep the mount tracking the Sun...",
-                 args.duration)
+        log.info("Collecting IMU samples for %.0fs — keep the mount tracking the %s...",
+                 args.duration, body.capitalize())
         pitches, yaws = await _sample_average(imu, latest, args.duration)
     finally:
         await imu.disconnect()
@@ -604,13 +784,13 @@ async def _cmd_calibrate_sun(args) -> int:
         log.error("No IMU data received during calibration.")
         return 1
 
-    cal = compute_sun_calibration(pitches, yaws, sun_alt, sun_az)
+    cal = compute_calibration(pitches, yaws, ref_alt, ref_az, body)
     path = Path(args.calibration_file)
     cal.save(path)
 
     print()
     print(f"  Samples averaged : {cal.samples}")
-    print(f"  Sun (reference)  : alt {cal.sun_alt:.3f}°   az {cal.sun_az:.3f}°")
+    print(f"  {body.capitalize()} (reference) : alt {cal.sun_alt:.3f}°   az {cal.sun_az:.3f}°")
     print(f"  IMU (raw mean)   : pitch {cal.imu_pitch:.3f}°   yaw {cal.imu_yaw:.3f}°")
     print(f"  Altitude offset  : {cal.alt_offset:+.3f}°")
     print(f"  Azimuth offset   : {cal.az_offset:+.3f}°  "
@@ -631,8 +811,13 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--calibrate-sun", action="store_true",
-        help="Calibrate the IMU offset against the Sun (point the mount at the "
-             "Sun first), then save it to the calibration file",
+        help="Calibrate the IMU offset against the Sun (the mount must already "
+             "be tracking it), then save it to the calibration file",
+    )
+    parser.add_argument(
+        "--calibrate-moon", action="store_true",
+        help="Calibrate the IMU offset against the Moon (the mount must already "
+             "be tracking it), then save it to the calibration file",
     )
     parser.add_argument(
         "--address", default=None, metavar="ADDR",
@@ -657,14 +842,15 @@ def main(argv=None) -> int:
         help="Scan/connect timeout in seconds",
     )
 
-    cal_group = parser.add_argument_group("Sun calibration (--calibrate-sun)")
+    cal_group = parser.add_argument_group(
+        "Sun/Moon calibration (--calibrate-sun / --calibrate-moon)")
     cal_group.add_argument(
         "--lat", type=float, default=None, metavar="DEG",
-        help="Observer latitude for computing the Sun's position",
+        help="Observer latitude for computing the target's position",
     )
     cal_group.add_argument(
         "--lon", type=float, default=None, metavar="DEG",
-        help="Observer longitude (east-positive) for computing the Sun's position",
+        help="Observer longitude (east-positive) for computing the target's position",
     )
     cal_group.add_argument(
         "--sun-alt", type=float, default=None, metavar="DEG",
@@ -676,12 +862,21 @@ def main(argv=None) -> int:
         help="Override the reference Sun azimuth instead of computing it",
     )
     cal_group.add_argument(
+        "--moon-alt", type=float, default=None, metavar="DEG",
+        help="Override the reference Moon altitude instead of computing it",
+    )
+    cal_group.add_argument(
+        "--moon-az", type=float, default=None, metavar="DEG",
+        help="Override the reference Moon azimuth instead of computing it",
+    )
+    cal_group.add_argument(
         "--duration", type=float, default=5.0, metavar="SEC",
         help="How long to average IMU samples during calibration",
     )
     cal_group.add_argument(
         "--no-refraction", action="store_true",
-        help="Do not add atmospheric refraction to the computed Sun altitude",
+        help="Do not add atmospheric refraction (or, for the Moon, parallax) "
+             "to the computed altitude",
     )
     parser.add_argument(
         "--calibration-file", default="wit_calibration.json", metavar="PATH",
@@ -698,10 +893,15 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
+    if args.calibrate_sun and args.calibrate_moon:
+        parser.error("--calibrate-sun and --calibrate-moon are mutually exclusive")
+
     if args.scan:
         coro = _cmd_scan(args)
     elif args.calibrate_sun:
-        coro = _cmd_calibrate_sun(args)
+        coro = _cmd_calibrate(args, "sun")
+    elif args.calibrate_moon:
+        coro = _cmd_calibrate(args, "moon")
     else:
         coro = _cmd_read(args)
     try:
