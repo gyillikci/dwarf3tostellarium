@@ -97,6 +97,9 @@ _GYRO_SCALE = 2000.0  # -> deg/s
 _ANGLE_SCALE = 180.0  # -> deg
 
 # ── device commands (0xFF 0xAA <reg> <lo> <hi>) ───────────────────────────────
+# WT9011DCL firmware locks its config registers; unlock must precede any write
+# to a config/calibration register (verified in wit_ble_scratch/wt9011dcl_ble_reader.py).
+CMD_UNLOCK = bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5])
 CMD_ACCEL_CAL = bytes([0xFF, 0xAA, 0x01, 0x01, 0x00])
 CMD_MAG_CAL = bytes([0xFF, 0xAA, 0x01, 0x07, 0x00])
 CMD_EXIT_CAL = bytes([0xFF, 0xAA, 0x01, 0x00, 0x00])
@@ -424,34 +427,40 @@ class WitIMU:
         # response=False matches the write-without-response used over BLE here.
         await self._client.write_gatt_char(WRITE_UUID, payload, response=False)
 
+    async def _unlock(self) -> None:
+        """Unlock the config registers; required before any config-register write."""
+        await self._write(CMD_UNLOCK)
+
     async def set_rate(self, hz: float) -> None:
         """Set the output data rate (one of SUPPORTED_RATES) and save it."""
         if hz not in _RATE_CMDS:
             raise ValueError(f"Unsupported rate {hz}; choose from {SUPPORTED_RATES}")
+        await self._unlock()
         await self._write(_RATE_CMDS[hz])
         await self._write(CMD_SAVE)
 
     async def set_dof(self, dof: int) -> None:
         """Select the fusion algorithm: 6 (no magnetometer) or 9 DOF."""
-        if dof == 6:
-            await self._write(CMD_DOF_6)
-        elif dof == 9:
-            await self._write(CMD_DOF_9)
-        else:
+        if dof not in (6, 9):
             raise ValueError("dof must be 6 or 9")
+        await self._unlock()
+        await self._write(CMD_DOF_6 if dof == 6 else CMD_DOF_9)
         await self._write(CMD_SAVE)
 
     async def calibrate_accelerometer(self) -> None:
         """Run the accelerometer calibration (keep the sensor level and still)."""
+        await self._unlock()
         await self._write(CMD_ACCEL_CAL)
         await asyncio.sleep(3.1)
         await self._write(CMD_EXIT_CAL)
 
     async def start_magnetometer_calibration(self) -> None:
         """Enter magnetometer calibration; rotate the sensor through all axes."""
+        await self._unlock()
         await self._write(CMD_MAG_CAL)
 
     async def stop_magnetometer_calibration(self) -> None:
+        await self._unlock()
         await self._write(CMD_EXIT_CAL)
 
 
