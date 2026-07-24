@@ -101,6 +101,12 @@ MIN_SPEED   = 9.0     # minimum command to overcome motor stiction
 AZ_SIGN     = +1.0    # flip if azimuth (left/right) correction goes wrong way
 ALT_SIGN    = +1.0    # flip if altitude (up/down) correction goes wrong way
 
+# ── Keyboard jog (arrow keys) ───────────────────────────────────────────────────
+# Manual joystick control while an arrow key is held, using the same AZ_SIGN/
+# ALT_SIGN convention as the ROI-based corrections above so it stays consistent
+# with whatever those get tuned to.
+ARROW_KEY_SPEED = 30.0   # joystick magnitude while a key is held
+
 # ── Direct slew tuning (Center-on-ROI) ────────────────────────────────────────
 # Drives the motors open-loop to bring the selected ROI centre to the frame
 # centre, independent of the firmware visual tracker. Drag a box -> the mount
@@ -336,6 +342,7 @@ class App:
         self._multi_disp = []    # [(id, sx, sy, ex, ey)] clickable detected boxes
         self._moving = False     # joystick currently commanded non-zero
         self._slewing = False    # a manual Center-on-ROI slew is in progress
+        self._keys_down: set[str] = set()   # arrow keys currently held (keyboard jog)
         # live diagnostics captured from the device notify stream (WS thread)
         self._diag = {
             "counts": defaultdict(int),
@@ -363,6 +370,13 @@ class App:
                            state="readonly", width=12)
         cam.pack(side=tk.LEFT, padx=(4, 12))
         cam.bind("<<ComboboxSelected>>", lambda _e: self._switch_camera())
+        # ttk.Combobox has its own Up/Down class bindings that cycle its
+        # selection and consume the event before it reaches root — override
+        # with instance bindings (these win) so arrow keys jog the mount
+        # instead of changing the camera dropdown while it has focus.
+        for _key in ("Up", "Down", "Left", "Right"):
+            cam.bind(f"<KeyPress-{_key}>", lambda _e, k=_key: self._jog_press_break(k))
+            cam.bind(f"<KeyRelease-{_key}>", lambda _e, k=_key: self._jog_release_break(k))
 
         self.btn_connect = tk.Button(bar, text="Connect", width=11,
                                      command=self._toggle_connect)
@@ -494,6 +508,19 @@ class App:
                  bg="#1c1c24", font=("Consolas", 9)).pack(
             side=tk.BOTTOM, fill=tk.X)
 
+        # Arrow-key keyboard jog. Bound on root (not the canvas) so it fires
+        # regardless of which widget has focus, as long as no Entry/text
+        # widget steals it — this GUI has none.
+        for _key in ("Up", "Down", "Left", "Right"):
+            root.bind(f"<KeyPress-{_key}>",
+                      lambda _e, k=_key: self._on_arrow_press(k))
+            root.bind(f"<KeyRelease-{_key}>",
+                      lambda _e, k=_key: self._on_arrow_release(k))
+        # Safety net: if the window loses focus while a key is held, no
+        # KeyRelease ever fires and the motor would keep running — force-stop.
+        root.bind("<FocusOut>", lambda _e: self._on_arrow_focus_lost())
+        root.focus_set()
+
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(30, self._poll_frame)
         self.root.after(LOOP_MS, self._control_tick)
@@ -502,7 +529,11 @@ class App:
 
     # -- status (updates a Tk variable; safe to call from worker threads) --
     def _status(self, msg: str) -> None:
-        self.status_var.set(msg)
+        # Python 3.12 enforces that Tcl calls come from the thread that
+        # created the interpreter — a direct .set() from FrameGrabber/WIT's
+        # background threads now raises "main thread is not in main loop"
+        # instead of silently working. Marshal onto the Tk main thread.
+        self.root.after(0, lambda: self.status_var.set(msg))
 
     def _rtsp_url(self) -> str:
         return f"rtsp://{self.ip}/{CAMERAS[self.cam_var.get()]}/stream0"
@@ -1086,7 +1117,7 @@ class App:
         return s
 
     def _control_tick(self) -> None:
-        if self._slewing:
+        if self._slewing or self._keys_down:
             self.root.after(LOOP_MS, self._control_tick)
             return
         active = (self._tracking and self.loop_var.get()
@@ -1097,6 +1128,50 @@ class App:
             self.ctl.joystick_stop()
             self._moving = False
         self.root.after(LOOP_MS, self._control_tick)
+
+    # ── keyboard jog (arrow keys) ────────────────────────────────────────────
+    def _on_arrow_press(self, key: str) -> None:
+        if key in self._keys_down:
+            return   # ignore OS key-repeat while held
+        self._keys_down.add(key)
+        self._apply_arrow_joystick()
+
+    def _on_arrow_release(self, key: str) -> None:
+        self._keys_down.discard(key)
+        self._apply_arrow_joystick()
+
+    def _jog_press_break(self, key: str) -> str:
+        """Same as _on_arrow_press, but returns 'break' to stop the event
+        reaching a focused widget's own arrow-key bindings (e.g. Combobox)."""
+        self._on_arrow_press(key)
+        return "break"
+
+    def _jog_release_break(self, key: str) -> str:
+        self._on_arrow_release(key)
+        return "break"
+
+    def _on_arrow_focus_lost(self) -> None:
+        if self._keys_down:
+            self._keys_down.clear()
+            self._apply_arrow_joystick()
+
+    def _apply_arrow_joystick(self) -> None:
+        if self.ctl is None:
+            self._keys_down.clear()
+            return
+        jx = jy = 0.0
+        if "Right" in self._keys_down: jx += AZ_SIGN * ARROW_KEY_SPEED
+        if "Left" in self._keys_down:  jx -= AZ_SIGN * ARROW_KEY_SPEED
+        if "Up" in self._keys_down:    jy += ALT_SIGN * ARROW_KEY_SPEED
+        if "Down" in self._keys_down:  jy -= ALT_SIGN * ARROW_KEY_SPEED
+        if jx == 0.0 and jy == 0.0:
+            self.ctl.joystick_stop()
+            self._moving = False
+            self._status("Keyboard jog stopped.")
+        else:
+            self.ctl.joystick(jx, jy)
+            self._moving = True
+            self._status(f"Keyboard jog: joy({jx:+.0f},{jy:+.0f})")
 
     def _drive_to_center(self) -> None:
         box = self.ctl.state.get("track_box")
@@ -1159,12 +1234,12 @@ class App:
         self._log_capture(rec)
         if att is not None and att.get("calibrated"):
             self._status(
-                f"📷 Tele photo taken (saved on device). IMU alt={att['altitude']:+.2f}° "
-                f"az={att['azimuth']:.2f}° → {self.capture_log}")
+                f"📷 Tele photo taken (saved on device). IMU alt={att['altitude']:+.3f}° "
+                f"az={att['azimuth']:.3f}° → {self.capture_log}")
         elif att is not None:
             self._status(
-                f"📷 Tele photo taken (saved on device). IMU roll={att['roll']:+.2f} "
-                f"pitch={att['pitch']:+.2f} yaw={att['yaw']:+.2f} → {self.capture_log}")
+                f"📷 Tele photo taken (saved on device). IMU roll={att['roll']:+.3f} "
+                f"pitch={att['pitch']:+.3f} yaw={att['yaw']:+.3f} → {self.capture_log}")
         else:
             self._status(
                 "📷 Tele photo taken (saved on device). No IMU attitude recorded "
@@ -1209,12 +1284,12 @@ class App:
                 self.wit_var.set("IMU: connected — waiting for data…")
             else:
                 cal = "cal" if att.get("calibrated") else "raw"
-                line = (f"IMU[{cal}]: roll={att['roll']:+.2f}  "
-                        f"pitch={att['pitch']:+.2f}  yaw={att['yaw']:+.2f}  "
+                line = (f"IMU[{cal}]: roll={att['roll']:+.3f}  "
+                        f"pitch={att['pitch']:+.3f}  yaw={att['yaw']:+.3f}  "
                         f"(age {att['age_s']:.1f}s)")
                 if att.get("calibrated"):
-                    line += (f"   →   alt={att['altitude']:+.2f}°  "
-                             f"az={att['azimuth']:.2f}°")
+                    line += (f"   →   alt={att['altitude']:+.3f}°  "
+                             f"az={att['azimuth']:.3f}°")
                 self.wit_var.set(line)
         self.root.after(200, self._wit_tick)
 
@@ -1285,6 +1360,11 @@ class ListenOnlyApp:
         self._poll()
 
     def _on_status(self, key: str, s: str) -> None:
+        # Called from a FrameGrabber worker thread — marshal onto the Tk
+        # main thread (Python 3.12 raises if Tcl is touched from elsewhere).
+        self.root.after(0, self._apply_status, key, s)
+
+    def _apply_status(self, key: str, s: str) -> None:
         self.statuses[key] = s
         self.status_var.set("   |   ".join(
             f"{dict(self.PANES)[k]}: {v}" for k, v in self.statuses.items()))
@@ -1325,10 +1405,6 @@ def main() -> int:
                         help="WitMotion IMU BLE address (else auto-scan on connect)")
     parser.add_argument("--wit-name", default=None,
                         help="WitMotion IMU BLE name substring to match")
-    args = parser.parse_args()
-
-    root = tk.Tk()
-    App(root, args.ip, wit_address=args.wit_address, wit_name=args.wit_name)
     parser.add_argument("--listen-only", action="store_true",
                          help="Video-only dual-pane viewer (tele + wide side by "
                               "side): never connects the control WebSocket, sends "
@@ -1340,7 +1416,7 @@ def main() -> int:
     if args.listen_only:
         ListenOnlyApp(root, args.ip)
     else:
-        App(root, args.ip)
+        App(root, args.ip, wit_address=args.wit_address, wit_name=args.wit_name)
     root.mainloop()
     return 0
 
