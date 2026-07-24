@@ -22,5 +22,11 @@ test_grab.py
 # Runtime logs
 *.log
 
+# Capture log (photo + IMU attitude records written by roi_gui)
+captures.jsonl
+
+# WitMotion Sun/Moon calibration produced at runtime
+wit_calibration.json
+
 # skyfield ephemeris cache (downloaded on first use, ~17MB)
 .skyfield_cache/
