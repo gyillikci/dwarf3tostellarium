@@ -25,6 +25,8 @@ Notes
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import math
 import os
 import queue
@@ -32,6 +34,8 @@ import threading
 import time
 import tkinter as tk
 from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
 from tkinter import ttk
 
 import numpy as np
@@ -187,14 +191,141 @@ class FrameGrabber(threading.Thread):
         self._running = False
 
 
+# ── WitMotion IMU monitor (optional, BLE via wit_imu.WitIMU) ──────────────────
+class WitMonitor:
+    """Run a WitMotion BLE IMU in a background asyncio thread and keep the latest
+    attitude sample available for the Tk main thread.
+
+    The transport, frame decode and Sun/Moon calibration all live in wit_imu.py;
+    this is just the glue that lets the Tkinter GUI show a live roll/pitch/yaw
+    readout and snapshot the mount attitude at capture time. wit_imu (and its
+    ``bleak`` dependency) are imported lazily so the GUI still runs without them.
+    """
+
+    CALIB_PATH = "wit_calibration.json"
+
+    def __init__(self, status_cb, address=None, name=None) -> None:
+        self._status = status_cb
+        self._address = address
+        self._name = name
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._imu = None                    # wit_imu.WitIMU
+        self._calib = None                  # wit_imu.Calibration | None
+        self._latest = None                 # (SensorData, ts) — atomic swap
+        self._connected = False
+        self._err: str | None = None
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def active(self) -> bool:
+        """True while the background thread is alive (connecting or connected)."""
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def error(self) -> str | None:
+        return self._err
+
+    def _on_data(self, sample) -> None:
+        # Called from the asyncio thread for every decoded frame. A single tuple
+        # assignment is atomic in CPython, so the Tk thread can read it freely.
+        self._latest = (sample, time.time())
+
+    def start(self) -> None:
+        if self.active:
+            return
+        self._err = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            from wit_imu import WitIMU, Calibration   # lazy: needs bleak
+        except Exception as exc:                       # ImportError if bleak absent
+            self._err = f"WIT unavailable ({exc})"
+            self._status(self._err)
+            return
+        try:
+            p = Path(self.CALIB_PATH)
+            if p.exists():
+                self._calib = Calibration.load(p)      # Sun/Moon offset, if made
+        except Exception:
+            self._calib = None
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._imu = WitIMU(on_data=self._on_data)
+        try:
+            self._loop.run_until_complete(
+                self._imu.connect(address=self._address, name=self._name))
+            self._connected = True
+            self._status("WIT IMU connected — live attitude streaming.")
+            self._loop.run_forever()
+        except Exception as exc:
+            self._err = f"WIT connect failed ({exc})"
+            self._status(self._err)
+        finally:
+            self._connected = False
+            try:
+                self._loop.run_until_complete(self._imu.disconnect())
+            except Exception:
+                pass
+            self._loop.close()
+            self._loop = None
+            self._imu = None
+
+    def stop(self) -> None:
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._connected = False
+        self._latest = None
+        self._thread = None
+
+    def snapshot(self) -> dict | None:
+        """Return the current attitude as a plain dict, or None if no sample yet."""
+        item = self._latest
+        if item is None:
+            return None
+        sample, ts = item
+        rec = {
+            "age_s": round(time.time() - ts, 3),
+            "roll": round(sample.angle.x, 3),
+            "pitch": round(sample.angle.y, 3),
+            "yaw": round(sample.angle.z, 3),
+            "acc_g": [round(sample.acceleration.x, 4),
+                      round(sample.acceleration.y, 4),
+                      round(sample.acceleration.z, 4)],
+        }
+        if self._calib is not None:
+            alt, az = self._calib.apply(sample)         # true alt/az from offsets
+            rec["altitude"] = round(alt, 3)
+            rec["azimuth"] = round(az, 3)
+            rec["calibrated"] = True
+        else:
+            # uncalibrated: raw pitch doubles as altitude (see wit_imu README)
+            rec["altitude"] = round(sample.altitude, 3)
+            rec["calibrated"] = False
+        return rec
+
+
 # ── Main application ──────────────────────────────────────────────────────────
 class App:
-    def __init__(self, root: tk.Tk, ip: str) -> None:
+    def __init__(self, root: tk.Tk, ip: str,
+                 wit_address: str | None = None,
+                 wit_name: str | None = None) -> None:
         self.root = root
         self.ip = ip
         self.ctl: DwarfLab | None = None
         self.grabber: FrameGrabber | None = None
         self.frame_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
+
+        # WitMotion IMU (optional, connected independently of the DWARF)
+        self.wit: WitMonitor | None = None
+        self.wit_address = wit_address
+        self.wit_name = wit_name
+        self.capture_log = "captures.jsonl"
 
         self.roi: tuple[int, int, int, int] | None = None   # frame-pixel ROI
         self._drag_start: tuple[int, int] | None = None      # canvas coords
@@ -310,6 +441,30 @@ class App:
                            self.btn_focus_step_in, self.btn_focus_step_out,
                            self.btn_focus_far]
 
+        # -- capture + IMU toolbar --
+        bar3 = tk.Frame(root, bg="#1a1a1f")
+        bar3.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 6))
+        tk.Label(bar3, text="Capture:", fg="#ddd", bg="#1a1a1f").pack(
+            side=tk.LEFT)
+        # Telephoto still (CMD_CAMERA_TELE_PHOTOGRAPH). Enabled once connected.
+        self.btn_capture = tk.Button(bar3, text="📷 Photo (Tele)", width=14,
+                                     state=tk.DISABLED,
+                                     command=self._capture_photo)
+        self.btn_capture.pack(side=tk.LEFT, padx=(4, 12))
+        self.wit_attach = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            bar3, text="Record IMU attitude with photo",
+            variable=self.wit_attach, fg="#ddd", bg="#1a1a1f",
+            selectcolor="#1a1a1f", activebackground="#1a1a1f",
+            activeforeground="#ddd").pack(side=tk.LEFT)
+
+        # IMU (WitMotion) connect — independent of the DWARF connection
+        self.btn_wit = tk.Button(bar3, text="Connect WIT IMU", width=15,
+                                 command=self._toggle_wit)
+        self.btn_wit.pack(side=tk.RIGHT)
+        tk.Label(bar3, text="IMU:", fg="#ddd", bg="#1a1a1f").pack(
+            side=tk.RIGHT, padx=(12, 2))
+
         # -- video canvas --
         self.canvas = tk.Canvas(root, bg="#0e0e12", highlightthickness=0,
                                 cursor="crosshair")
@@ -333,10 +488,17 @@ class App:
                  bg="#1c1c24", font=("Consolas", 9)).pack(
             side=tk.BOTTOM, fill=tk.X)
 
+        # -- IMU attitude row (WitMotion roll/pitch/yaw + calibrated alt/az) --
+        self.wit_var = tk.StringVar(value="IMU: (not connected)")
+        tk.Label(root, textvariable=self.wit_var, anchor=tk.W, fg="#ffd479",
+                 bg="#1c1c24", font=("Consolas", 9)).pack(
+            side=tk.BOTTOM, fill=tk.X)
+
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(30, self._poll_frame)
         self.root.after(LOOP_MS, self._control_tick)
         self.root.after(300, self._diag_tick)
+        self.root.after(200, self._wit_tick)
 
     # -- status (updates a Tk variable; safe to call from worker threads) --
     def _status(self, msg: str) -> None:
@@ -376,6 +538,7 @@ class App:
         self.btn_ai.config(state=tk.NORMAL)
         self.btn_center.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.NORMAL)
+        self.btn_capture.config(state=tk.NORMAL)
         for b in self.mode_btns.values():
             b.config(state=tk.NORMAL)
         self.btn_auto_stop.config(state=tk.NORMAL)
@@ -413,6 +576,7 @@ class App:
         self.btn_ai.config(state=tk.DISABLED)
         self.btn_center.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.DISABLED)
+        self.btn_capture.config(state=tk.DISABLED)
         for b in self.mode_btns.values():
             b.config(state=tk.DISABLED)
         self.btn_auto_stop.config(state=tk.DISABLED)
@@ -967,7 +1131,96 @@ class App:
                 f"tracking: correcting err({nx:+.2f},{ny:+.2f}) "
                 f"joy({jx:+.0f},{jy:+.0f})")
 
+    # ── capture (telephoto photo + IMU attitude snapshot) ────────────────────
+    def _capture_photo(self) -> None:
+        """Trigger a telephoto still on the DWARF and log it together with the
+        current WitMotion IMU attitude.
+
+        The photo command (CMD_CAMERA_TELE_PHOTOGRAPH / 10002) is telephoto-only,
+        so it captures the tele lens regardless of which feed is previewed. The
+        JPEG is written to the device's own storage; here we record a timestamped
+        line in captures.jsonl with the mount attitude at the shutter instant.
+        """
+        if self.ctl is None:
+            self._status("Connect to the DWARF first.")
+            return
+        self.ctl.take_photo()                       # CMD_CAMERA_TELE_PHOTOGRAPH
+        rec = {
+            "timestamp": datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"),
+            "camera": "tele",
+            "cmd": "CMD_CAMERA_TELE_PHOTOGRAPH(10002)",
+        }
+        att = None
+        if self.wit_attach.get() and self.wit is not None and self.wit.connected:
+            att = self.wit.snapshot()
+            if att is not None:
+                rec["imu"] = att
+        self._log_capture(rec)
+        if att is not None and att.get("calibrated"):
+            self._status(
+                f"📷 Tele photo taken (saved on device). IMU alt={att['altitude']:+.2f}° "
+                f"az={att['azimuth']:.2f}° → {self.capture_log}")
+        elif att is not None:
+            self._status(
+                f"📷 Tele photo taken (saved on device). IMU roll={att['roll']:+.2f} "
+                f"pitch={att['pitch']:+.2f} yaw={att['yaw']:+.2f} → {self.capture_log}")
+        else:
+            self._status(
+                "📷 Tele photo taken (saved on device). No IMU attitude recorded "
+                "(connect the WIT IMU to capture angles).")
+
+    def _log_capture(self, rec: dict) -> None:
+        try:
+            with open(self.capture_log, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        except Exception as exc:
+            self._status(f"Photo taken but capture-log write failed: {exc}")
+
+    # ── WitMotion IMU (attitude capture) ─────────────────────────────────────
+    def _toggle_wit(self) -> None:
+        if self.wit is not None and self.wit.active:
+            self.wit.stop()
+            self.wit = None
+            self.btn_wit.config(text="Connect WIT IMU")
+            self.wit_var.set("IMU: (disconnected)")
+            self._status("WIT IMU disconnected.")
+            return
+        self.wit = WitMonitor(self._status, address=self.wit_address,
+                              name=self.wit_name)
+        self.wit.start()
+        self.btn_wit.config(text="Disconnect WIT")
+        self._status("Connecting to WIT IMU over Bluetooth…")
+
+    def _wit_tick(self) -> None:
+        w = self.wit
+        if w is None:
+            self.wit_var.set("IMU: (not connected)")
+        elif not w.active and not w.connected:
+            # background thread ended (connect failed, missing bleak, or stopped)
+            self.wit_var.set(f"IMU: {w.error or 'disconnected'}")
+            self.btn_wit.config(text="Connect WIT IMU")
+            self.wit = None
+        elif not w.connected:
+            self.wit_var.set("IMU: connecting…")
+        else:
+            att = w.snapshot()
+            if att is None:
+                self.wit_var.set("IMU: connected — waiting for data…")
+            else:
+                cal = "cal" if att.get("calibrated") else "raw"
+                line = (f"IMU[{cal}]: roll={att['roll']:+.2f}  "
+                        f"pitch={att['pitch']:+.2f}  yaw={att['yaw']:+.2f}  "
+                        f"(age {att['age_s']:.1f}s)")
+                if att.get("calibrated"):
+                    line += (f"   →   alt={att['altitude']:+.2f}°  "
+                             f"az={att['azimuth']:.2f}°")
+                self.wit_var.set(line)
+        self.root.after(200, self._wit_tick)
+
     def _on_close(self) -> None:
+        if self.wit is not None:
+            self.wit.stop()
         self._disconnect()
         self.root.destroy()
 
@@ -1068,6 +1321,14 @@ class ListenOnlyApp:
 def main() -> int:
     parser = argparse.ArgumentParser(description="DWARF 3 live ROI tracker GUI")
     parser.add_argument("--ip", default="192.168.1.102", help="DWARF 3 IP address")
+    parser.add_argument("--wit-address", default=None,
+                        help="WitMotion IMU BLE address (else auto-scan on connect)")
+    parser.add_argument("--wit-name", default=None,
+                        help="WitMotion IMU BLE name substring to match")
+    args = parser.parse_args()
+
+    root = tk.Tk()
+    App(root, args.ip, wit_address=args.wit_address, wit_name=args.wit_name)
     parser.add_argument("--listen-only", action="store_true",
                          help="Video-only dual-pane viewer (tele + wide side by "
                               "side): never connects the control WebSocket, sends "

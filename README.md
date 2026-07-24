@@ -56,6 +56,41 @@ Steps:
     - The bridge logs GOTO → RA … Dec … and the Dwarf3 starts its one-click goto sequence (plate-solve → slew → track)
 
 ---
+Live ROI GUI — photo capture & IMU attitude
+
+`roi_gui.py` is the Tkinter live-video window (drag a box to track). It also
+lets you trigger a still and record the mount attitude:
+
+    pip install opencv-python numpy Pillow bleak
+    python3 roi_gui.py --ip 192.168.1.102
+
+- **📷 Photo (Tele)** — takes a telephoto still on the DWARF
+  (`CMD_CAMERA_TELE_PHOTOGRAPH`). The JPEG is saved to the device's own storage;
+  the button also writes a timestamped line to `captures.jsonl`. This is the
+  telephoto lens regardless of which feed (wide/tele) is being previewed.
+- **Connect WIT IMU** — connects to the WitMotion BLE IMU independently of the
+  DWARF and shows a live roll / pitch / yaw readout at the bottom of the window.
+  If a `wit_calibration.json` exists (see below) it also shows corrected
+  altitude / azimuth.
+- **Record IMU attitude with photo** (checkbox, on by default) — when a photo is
+  taken and the IMU is connected, the current attitude (angles, and calibrated
+  alt/az if available) is stored in the `captures.jsonl` record for that photo.
+
+Optionally pin the sensor so it connects without scanning:
+
+    python3 roi_gui.py --ip 192.168.1.102 --wit-address AA:BB:CC:DD:EE:FF
+
+Each `captures.jsonl` line looks like:
+
+    {"timestamp": "2026-07-24T21:05:12.482+00:00", "camera": "tele",
+     "cmd": "CMD_CAMERA_TELE_PHOTOGRAPH(10002)",
+     "imu": {"roll": 1.23, "pitch": 48.11, "yaw": 271.4, "altitude": 48.9,
+             "azimuth": 271.4, "calibrated": true, "age_s": 0.05}}
+
+`bleak` is optional here — without it the video, tracking and photo button still
+work; only the WIT IMU button is unavailable.
+
+---
 WitMotion IMU (polar alignment helper)
 
 `wit_imu.py` is a standalone helper for a WitMotion BLE IMU (WT901BLE / BWT901BLE
