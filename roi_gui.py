@@ -95,15 +95,43 @@ GAIN        = 70.0    # proportional gain: error(-1..1) -> joystick units
 MAX_SPEED   = 45.0    # clamp joystick magnitude per axis
 MIN_SPEED   = 9.0     # minimum command to overcome motor stiction
 AZ_SIGN     = +1.0    # flip if azimuth (left/right) correction goes wrong way
-ALT_SIGN    = -1.0    # image +y is down, motor +y is North(up) -> invert
+ALT_SIGN    = +1.0    # flip if altitude (up/down) correction goes wrong way
 
 # ── Direct slew tuning (Center-on-ROI) ────────────────────────────────────────
 # Drives the motors open-loop to bring the selected ROI centre to the frame
 # centre, independent of the firmware visual tracker. Drag a box -> the mount
 # slews toward it. Repeat to refine. This always produces motor motion.
 SLEW_SPEED     = 35.0   # joystick magnitude used during a manual slew
-SLEW_TIME_FULL = 1.10   # seconds of slew for a full half-frame offset
+SLEW_TIME_FULL = 1.10   # seconds of slew for a full half-frame offset, TUNED ON WIDE
 SLEW_MIN_OFF   = 0.04   # ignore tiny offsets (already centred)
+
+# Tele's FOV is much narrower than wide's, so the same fractional-frame ROI
+# offset is a much smaller *angle* to slew through on tele than on wide.
+# SLEW_SPEED/SLEW_TIME_FULL above were tuned against the wide camera; reusing
+# them verbatim for tele way overshoots (mount keeps slewing long after the
+# target has left the tele frame). Best-effort published-spec values — retune
+# here if the mount over/undershoots.
+TELE_FOV_DEG = 3.4
+WIDE_FOV_DEG = 60.0
+TELE_SLEW_SCALE = TELE_FOV_DEG / WIDE_FOV_DEG   # total angle to move, relative to wide
+
+# How TELE_SLEW_SCALE is split between speed and duration. speed_scale =
+# TELE_SLEW_SCALE**TELE_SLEW_SPEED_EXP, dur_scale = TELE_SLEW_SCALE**(1-EXP),
+# so their product always equals TELE_SLEW_SCALE regardless of the split.
+#   EXP=0    -> full speed, all reduction on duration: field-tested TOO
+#               AGGRESSIVE (overshoots) despite the short pulse.
+#   EXP=0.25 -> field-tested STILL TOO FAST.
+#   EXP=0.5  -> sqrt/sqrt split: field-tested TOO WEAK (speed drops below
+#               what's needed to reliably break the mount's static friction).
+# 0.375 (between the too-fast 0.25 and too-weak 0.5) is the current
+# best-effort middle ground — retune here if it still over/undershoots.
+TELE_SLEW_SPEED_EXP = 0.375
+
+# Soft-start: ramp the joystick magnitude up over this many steps/ms instead of
+# snapping to full speed in one command, mirroring the app's own behaviour and
+# avoiding a stiction-breakaway lurch (worst on tele's narrow FOV).
+SLEW_RAMP_STEPS = 6
+SLEW_RAMP_STEP_MS = 35
 
 # ── Sentinel/UFO auto-track profiles ──────────────────────────────────────────
 # Firmware auto-detects + drives its own motors in these modes. The `mode` int
@@ -764,20 +792,45 @@ class App:
         if mag < SLEW_MIN_OFF:
             self._status("ROI already centred — nothing to slew.")
             return
-        # unit direction -> joystick vector at SLEW_SPEED
-        jx = AZ_SIGN * (nx / mag) * SLEW_SPEED
-        jy = ALT_SIGN * (ny / mag) * SLEW_SPEED
-        dur = SLEW_TIME_FULL * min(1.0, mag)         # seconds
+        is_wide = CAMERAS.get(self.cam_var.get()) == "ch1"
+        if is_wide:
+            speed_scale = dur_scale = 1.0
+        else:
+            speed_scale = TELE_SLEW_SCALE ** TELE_SLEW_SPEED_EXP
+            dur_scale = TELE_SLEW_SCALE ** (1.0 - TELE_SLEW_SPEED_EXP)
+        speed = SLEW_SPEED * speed_scale
+        jx = AZ_SIGN * (nx / mag) * speed
+        jy = ALT_SIGN * (ny / mag) * speed
+        dur = SLEW_TIME_FULL * min(1.0, mag) * dur_scale  # seconds
         # stop any auto-center activity while we slew
         if self._moving:
             self.ctl.joystick_stop()
             self._moving = False
         self._slewing = True
-        self.ctl.joystick(jx, jy)
         self._status(
             f"Slewing to ROI: dir({nx:+.2f},{ny:+.2f}) "
-            f"joy({jx:+.0f},{jy:+.0f}) for {dur:.2f}s")
-        self.root.after(int(dur * 1000), self._end_slew)
+            f"joy({jx:+.0f},{jy:+.0f}) for {dur:.2f}s"
+            + ("" if is_wide else
+               f" (tele-scaled speed x{speed_scale:.3f}, dur x{dur_scale:.3f})"))
+        # Soft-start: ramp 1..SLEW_RAMP_STEPS/SLEW_RAMP_STEPS of full magnitude
+        # instead of snapping straight to it (matches the real app's own
+        # joystick stream, which never jumps to full speed in one message).
+        # Cap the ramp itself to a fraction of dur so short tele pulses don't
+        # spend their *entire* duration still ramping up.
+        ramp_total_ms = min(SLEW_RAMP_STEPS * SLEW_RAMP_STEP_MS, int(dur * 1000 * 0.6))
+        ramp_step_ms = max(10, ramp_total_ms // SLEW_RAMP_STEPS)
+        self._slew_ramp(jx, jy, 1, dur, ramp_step_ms)
+
+    def _slew_ramp(self, jx: float, jy: float, step: int, dur: float,
+                   ramp_step_ms: int) -> None:
+        frac = min(1.0, step / SLEW_RAMP_STEPS)
+        self.ctl.joystick(jx * frac, jy * frac)
+        if step < SLEW_RAMP_STEPS:
+            self.root.after(ramp_step_ms,
+                             lambda: self._slew_ramp(jx, jy, step + 1, dur, ramp_step_ms))
+        else:
+            remaining = max(0, int(dur * 1000) - SLEW_RAMP_STEPS * ramp_step_ms)
+            self.root.after(remaining, self._end_slew)
 
     def _end_slew(self) -> None:
         if self.ctl is not None:
@@ -919,13 +972,114 @@ class App:
         self.root.destroy()
 
 
+# ── Listen-only dual-pane viewer ───────────────────────────────────────────────
+class ListenOnlyApp:
+    """Pure video viewer: both RTSP streams (tele + wide) side by side, no WS
+    connection at all. The control WebSocket (:9900) is exclusive at the
+    transport level — field-tested: even connecting without requesting the
+    host lock or sending any command still gets DEVICE_OCCUPIED-bumped while
+    another client (e.g. the phone app) holds it. RTSP video has no such
+    exclusivity (confirmed by direct probing), so this never competes with
+    whatever else is driving the mount.
+    """
+
+    PANES = (("ch0", "Tele"), ("ch1", "Wide"))
+
+    def __init__(self, root: tk.Tk, ip: str) -> None:
+        self.root = root
+        self.ip = ip
+        self.grabbers: dict[str, FrameGrabber] = {}
+        self.queues: dict[str, "queue.Queue[np.ndarray]"] = {}
+        self.canvases: dict[str, tk.Canvas] = {}
+        self.photos: dict[str, ImageTk.PhotoImage | None] = {}
+        self.statuses: dict[str, str] = {k: "" for k, _ in self.PANES}
+
+        root.title(f"DWARF 3 — Listen Only ({ip})")
+        root.geometry("1600x720")
+        root.configure(bg="#1a1a1f")
+
+        tk.Label(root, text=f"{ip} — video only, no commands sent "
+                             "(drive the mount from the phone app)",
+                 fg="#ddd", bg="#1a1a1f").pack(side=tk.TOP, anchor=tk.W, padx=8, pady=6)
+
+        panes = tk.Frame(root, bg="#1a1a1f")
+        panes.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        for key, label in self.PANES:
+            pane = tk.Frame(panes, bg="#1a1a1f")
+            pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+            tk.Label(pane, text=label, fg="#ddd", bg="#1a1a1f").pack(side=tk.TOP, anchor=tk.W)
+            cv = tk.Canvas(pane, bg="#0e0e12", highlightthickness=0)
+            cv.pack(fill=tk.BOTH, expand=True)
+            self.canvases[key] = cv
+            self.photos[key] = None
+            self.queues[key] = queue.Queue(maxsize=2)
+
+        self.status_var = tk.StringVar(value="connecting...")
+        tk.Label(root, textvariable=self.status_var, fg="#9cf", bg="#1a1a1f",
+                 anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 6))
+
+        # Start the grabber threads only after status_var exists — their
+        # status callback fires from another thread almost immediately.
+        for key, _label in self.PANES:
+            url = f"rtsp://{ip}/{key}/stream0"
+            grabber = FrameGrabber(url, self.queues[key],
+                                    lambda s, k=key: self._on_status(k, s))
+            grabber.start()
+            self.grabbers[key] = grabber
+
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._poll()
+
+    def _on_status(self, key: str, s: str) -> None:
+        self.statuses[key] = s
+        self.status_var.set("   |   ".join(
+            f"{dict(self.PANES)[k]}: {v}" for k, v in self.statuses.items()))
+
+    def _poll(self) -> None:
+        for key, cv in self.canvases.items():
+            try:
+                frame = self.queues[key].get_nowait()
+            except queue.Empty:
+                frame = None
+            if frame is not None:
+                self._show(key, cv, frame)
+        self.root.after(30, self._poll)
+
+    def _show(self, key: str, cv: tk.Canvas, frame: np.ndarray) -> None:
+        cw = max(1, cv.winfo_width())
+        ch = max(1, cv.winfo_height())
+        fh, fw = frame.shape[:2]
+        scale = min(cw / fw, ch / fh)
+        dw, dh = max(1, int(fw * scale)), max(1, int(fh * scale))
+        ox, oy = (cw - dw) // 2, (ch - dh) // 2
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        photo = ImageTk.PhotoImage(Image.fromarray(rgb).resize((dw, dh)))
+        self.photos[key] = photo   # keep a reference alive
+        cv.delete("video")
+        cv.create_image(ox, oy, anchor=tk.NW, image=photo, tags="video")
+
+    def _on_close(self) -> None:
+        for g in self.grabbers.values():
+            g.stop()
+        self.root.destroy()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="DWARF 3 live ROI tracker GUI")
     parser.add_argument("--ip", default="192.168.1.102", help="DWARF 3 IP address")
+    parser.add_argument("--listen-only", action="store_true",
+                         help="Video-only dual-pane viewer (tele + wide side by "
+                              "side): never connects the control WebSocket, sends "
+                              "no commands, and cannot conflict with another "
+                              "client (e.g. the phone app) driving the mount.")
     args = parser.parse_args()
 
     root = tk.Tk()
-    App(root, args.ip)
+    if args.listen_only:
+        ListenOnlyApp(root, args.ip)
+    else:
+        App(root, args.ip)
     root.mainloop()
     return 0
 
