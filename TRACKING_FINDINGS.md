@@ -229,3 +229,41 @@ New `dwarf_capture_decode.py` flags built on it:
 
 The generic "unknown payload" dump now also annotates wire-type 1/5 fields with
 their `double`/`float` value, so even an unmapped command is readable at a glance.
+
+---
+
+## Tele overlay & tracking: boxes are in WIDE-camera space, not the tele frame
+
+The AI detector runs on the wide camera, so every track box (`15252`, and the
+multi-track boxes) is in **wide-camera pixel space** — even when the operator is
+watching the **tele** feed (`ch0`). The tele lens sees roughly the same boresight
+through a ~17× narrower FOV, so it is **not** a pixel crop of the wide frame.
+
+The old `roi_gui` drew and centred boxes against the *currently displayed*
+frame's `fw/fh`. On wide that is correct (displayed frame == box space). On tele
+it is wrong twice over:
+
+* **Overlay** — a wide-space box drawn straight onto the tele frame lands far
+  from the real target (worse the further off-centre the target is), which reads
+  as a large "offset" that is severe precisely because the tele FOV is tiny.
+* **Auto-centre** — the closed loop normalised the box against the tele frame, so
+  a target barely off wide-centre looked hugely off tele-centre → the motors
+  overshot and hunted, which reads as "lag".
+
+Fix (`roi_gui.py`): boxes are normalised to the wide FOV (`_box_wide_norm`, using
+the cached wide-stream size) and then mapped into whichever feed is shown
+(`_wide_to_display`). On the tele feed the offset-from-centre is magnified by
+`TELE_OVERLAY_MAG = WIDE_FOV_DEG / TELE_FOV_DEG` (≈17.6×), with `BORESIGHT_DX/DY`
+for the residual lens-to-lens offset; boxes whose centre falls outside the tele
+FOV are culled. The auto-centre loop now derives its error from the wide-space
+box directly, so it behaves identically regardless of which feed is displayed.
+
+`TELE_OVERLAY_MAG` (via the published FOV specs) and `BORESIGHT_DX/DY` are
+best-effort and **need on-device tuning**: watch the green box vs the real target
+on the tele feed, adjust the magnification until they track, then the boresight
+to remove any constant shift. RTSP glass-to-glass latency is unchanged — a fixed
+time lag simply looks ~17× larger through the tele FOV.
+
+Known follow-up: dragging a *new* ROI while the tele feed is shown still sends
+tele-frame pixels to the firmware (which expects wide pixels); start ROI/AI
+tracking from the wide feed until that inverse mapping is added.
