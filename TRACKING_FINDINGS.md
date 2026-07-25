@@ -229,3 +229,77 @@ New `dwarf_capture_decode.py` flags built on it:
 
 The generic "unknown payload" dump now also annotates wire-type 1/5 fields with
 their `double`/`float` value, so even an unmapped command is readable at a glance.
+
+---
+
+## Tele overlay & tracking: boxes are in WIDE-camera space, not the tele frame
+
+The AI detector runs on the wide camera, so every track box (`15252`, and the
+multi-track boxes) is in **wide-camera pixel space** — even when the operator is
+watching the **tele** feed (`ch0`). The tele lens sees roughly the same boresight
+through a ~17× narrower FOV, so it is **not** a pixel crop of the wide frame.
+
+The old `roi_gui` drew and centred boxes against the *currently displayed*
+frame's `fw/fh`. On wide that is correct (displayed frame == box space). On tele
+it is wrong twice over:
+
+* **Overlay** — a wide-space box drawn straight onto the tele frame lands far
+  from the real target (worse the further off-centre the target is), which reads
+  as a large "offset" that is severe precisely because the tele FOV is tiny.
+* **Auto-centre** — the closed loop normalised the box against the tele frame, so
+  a target barely off wide-centre looked hugely off tele-centre → the motors
+  overshot and hunted, which reads as "lag".
+
+Fix (`roi_gui.py`): boxes are normalised to the wide FOV (`_box_wide_norm`, using
+the cached wide-stream size) and then mapped into whichever feed is shown
+(`_wide_to_display`). On the tele feed the offset-from-centre is magnified by
+`TELE_OVERLAY_MAG = WIDE_FOV_DEG / TELE_FOV_DEG` (≈17.6×), with `BORESIGHT_DX/DY`
+for the residual lens-to-lens offset; boxes whose centre falls outside the tele
+FOV are culled. The auto-centre loop now derives its error from the wide-space
+box directly, so it behaves identically regardless of which feed is displayed.
+
+`TELE_OVERLAY_MAG` (via the published FOV specs) and `BORESIGHT_DX/DY` are
+best-effort and **need on-device tuning**: watch the green box vs the real target
+on the tele feed, adjust the magnification until they track, then the boresight
+to remove any constant shift. RTSP glass-to-glass latency is unchanged — a fixed
+time lag simply looks ~17× larger through the tele FOV.
+
+Known follow-up: dragging a *new* ROI while the tele feed is shown still sends
+tele-frame pixels to the firmware (which expects wide pixels); start ROI/AI
+tracking from the wide feed until that inverse mapping is added.
+
+### CORRECTION — the premise above ("tele notify is empty in practice") is contradicted by capture evidence
+
+A later session captured multiple **confirmed** tele-tracking sessions (both
+via `roi_gui.py` and the official app) and found `15225` (`NOTIFY_TRACK_RESULT`,
+tele) reporting real, large, actively-moving boxes — not empty:
+
+* `dwarftele3` capture: **1319** valid `15225` boxes, x roaming 596→1591 and
+  y 114→783 (following the actual dragged/tracked subject), while `15252`
+  (wide) sat frozen the whole session on a tiny (~40×40px) static point —
+  i.e. **tele's box was the real lock; wide's was noise**, the opposite of
+  what this section assumes.
+* Repeated in later captures (`dwarfcoldstart`, `dwarftrackmode`): both `15225`
+  and `15252` can carry real data depending on which camera is *actually*
+  locked — **box size + motion is the tell**, not which cmd number it is. A
+  tiny, motionless box is noise regardless of channel; a large, moving box is
+  the real lock.
+* An even earlier session already documented a "CONFIRMED WORKING RECIPE"
+  (§7 above) that got a **2592/2592-valid tele lock** using plain `14800` —
+  no wide-FOV remapping involved.
+
+Best guess at how the two sessions' observations differ: whoever captured the
+"tele notify is empty" session likely only exercised **wide** tracking (where
+`15225` legitimately does read `-100` throughout, since tele was never
+locked), and over-generalized "empty when not the active tracker" into
+"always empty." If `15225` genuinely carries real tele-space coordinates
+during a real tele lock (as the evidence above shows), then applying
+`TELE_OVERLAY_MAG` (~17.6×) to an **already-correct** tele box would badly
+overshoot the overlay/auto-centre in the opposite direction — potentially
+explaining reports of the fix making tele behavior *worse*, not better.
+
+**Not resolved either way with 100% certainty** — this needs a side-by-side
+live test (tele tracking, watch whether the green box lands on the real
+target with vs. without the wide-remapping applied) before either model is
+trusted as the final answer. `roi_gui.py` currently uses the frame-relative
+model (pre-remapping) pending that test.
