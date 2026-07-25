@@ -143,6 +143,32 @@ TELE_SLEW_SPEED_EXP = 0.375
 SLEW_RAMP_STEPS = 6
 SLEW_RAMP_STEP_MS = 35
 
+# ── Tele overlay / tracking geometry ──────────────────────────────────────────
+# The firmware's track boxes are ALWAYS in WIDE-camera pixel space: the AI
+# detector runs on the wide camera and emits the 15252 boxes there (the tele
+# notify 15225 is empty in practice — see TRACKING_FINDINGS.md). The wide feed
+# decodes to that same space, so on WIDE a box maps 1:1 onto the frame.
+#
+# The TELE lens looks at (nearly) the same boresight but through a ~17x narrower
+# FOV, so it is NOT a pixel-for-pixel crop of the wide frame. Drawing a
+# wide-space box straight onto the tele frame (the old code) puts it far from the
+# real target — worse the further the target is from centre. To overlay/track a
+# wide-space box while the TELE feed is shown, magnify its offset-from-centre by
+# the wide/tele FOV ratio and (optionally) shift by the lens boresight.
+#
+# BEST-EFFORT constants from DWARF 3 published specs — retune on-device: watch
+# the green box vs the real target on the tele feed and adjust MAG until they
+# track, then BORESIGHT_* to remove any residual constant shift.
+TELE_OVERLAY_MAG = WIDE_FOV_DEG / TELE_FOV_DEG   # ≈ 17.6x
+# Wide-frame-normalised (0..1) point that sits at the centre of the tele frame.
+# 0.0,0.0 means the two lenses are perfectly boresighted; nudge if the tele view
+# is consistently offset from the wide centre.
+BORESIGHT_DX = 0.0
+BORESIGHT_DY = 0.0
+# Fallback wide-stream size (px) used to normalise boxes before the wide feed has
+# been shown once; replaced with the real decoded size as soon as wide renders.
+WIDE_REF_WH = (1920, 1080)
+
 # ── Sentinel/UFO auto-track profiles ──────────────────────────────────────────
 # Firmware auto-detects + drives its own motors in these modes. The `mode` int
 # in ReqStartSentryMode selects the detection profile. Exact codes are not in
@@ -355,6 +381,9 @@ class App:
         # geometry of the displayed (letterboxed) frame within the canvas
         self._disp = (0, 0, 0, 0)   # x, y, w, h
         self._frame_wh = (0, 0)
+        # Last decoded WIDE-stream size — track boxes are in this space even while
+        # the tele feed is displayed. Seeded with a spec default until wide shows.
+        self._wide_wh = WIDE_REF_WH
 
         root.title(f"DWARF 3 — Live ROI Tracker ({ip})")
         root.geometry("1024x700")
@@ -647,6 +676,8 @@ class App:
         ch = max(1, self.canvas.winfo_height())
         fh, fw = frame.shape[:2]
         self._frame_wh = (fw, fh)
+        if self._current_cam() == "wide":
+            self._wide_wh = (fw, fh)   # cache the true wide-box reference size
         scale = min(cw / fw, ch / fh)
         dw, dh = max(1, int(fw * scale)), max(1, int(fh * scale))
         ox, oy = (cw - dw) // 2, (ch - dh) // 2
@@ -665,26 +696,59 @@ class App:
         if self._rect_id is not None:
             self.canvas.tag_raise(self._rect_id)
 
+    # ── coordinate spaces (boxes are always in WIDE-camera pixels) ───────────
+    def _current_cam(self) -> str:
+        """'tele' or 'wide' — which feed is currently displayed."""
+        return "tele" if CAMERAS.get(self.cam_var.get()) == "ch0" else "wide"
+
+    def _box_wide_norm(self, box) -> tuple[float, float, float, float] | None:
+        """Normalise a wide-pixel box (x,y,w,h) to the WIDE FOV as
+        (centre_x, centre_y, w, h) in 0..1, or None if it is a no-target box."""
+        if (not box or box[0] <= TRACK_NO_TARGET or box[1] <= TRACK_NO_TARGET):
+            return None
+        ww, wh = self._wide_wh
+        if ww == 0 or wh == 0:
+            return None
+        x, y, w, h = box
+        return ((x + w / 2.0) / ww, (y + h / 2.0) / wh, w / ww, h / wh)
+
+    def _wide_to_display(self, cx, cy, bw, bh):
+        """Map a wide-FOV-normalised box (centre + size, all 0..1) into 0..1 of
+        the currently displayed feed. Identity on wide; on tele, magnify the
+        offset-from-centre by the wide/tele FOV ratio (the tele lens sees a much
+        narrower FOV around the same boresight, so it is not a pixel crop)."""
+        if self._current_cam() == "tele":
+            m = TELE_OVERLAY_MAG
+            dnx = 0.5 + (cx - 0.5 - BORESIGHT_DX) * m
+            dny = 0.5 + (cy - 0.5 - BORESIGHT_DY) * m
+            return dnx, dny, bw * m, bh * m
+        return cx, cy, bw, bh
+
     def _draw_track_box(self, ox, oy, dw, dh, fw, fh) -> None:
         """Overlay the live (morphing) box the firmware is tracking, in green.
 
-        CAPTURE-VERIFIED: box coords are in WIDE-STREAM PIXELS (≈1920x1080 — an
-        app ROI of x=975,w=382 gives x+w=1357 > 1280, so the space is NOT
-        1280x720). The decoded RTSP frame is that same space, so scale by fw/fh.
+        Boxes are in WIDE-camera pixels (the detector runs on the wide cam). On
+        the wide feed that maps 1:1; on the tele feed the box is FOV-mapped so it
+        lands on the real target instead of near the frame centre.
         """
         self.canvas.delete("trackbox")
-        if self.ctl is None or fw == 0:
+        if self.ctl is None or dw == 0:
             return
-        box = self.ctl.state.get("track_box")
         ts = self.ctl.state.get("track_box_ts", 0.0)
-        if (not box or box[0] <= TRACK_NO_TARGET or box[1] <= TRACK_NO_TARGET
-                or (time.time() - ts) > BOX_STALE_S):
+        if (time.time() - ts) > BOX_STALE_S:
             return
-        bx, by, bw, bh = box
-        sx = ox + bx / fw * dw
-        sy = oy + by / fh * dh
-        ex = ox + (bx + bw) / fw * dw
-        ey = oy + (by + bh) / fh * dh
+        bn = self._box_wide_norm(self.ctl.state.get("track_box"))
+        if bn is None:
+            return
+        dnx, dny, dbw, dbh = self._wide_to_display(*bn)
+        # cull if the box centre falls outside the visible feed (target not in the
+        # tele FOV) — otherwise the tele magnification draws it way off-canvas
+        if not (0.0 <= dnx <= 1.0 and 0.0 <= dny <= 1.0):
+            return
+        sx = ox + (dnx - dbw / 2.0) * dw
+        sy = oy + (dny - dbh / 2.0) * dh
+        ex = ox + (dnx + dbw / 2.0) * dw
+        ey = oy + (dny + dbh / 2.0) * dh
         self.canvas.create_rectangle(sx, sy, ex, ey, outline="#39ff14",
                                      width=2, tags="trackbox")
 
@@ -715,10 +779,18 @@ class App:
             if not parsed:
                 continue
             oid, x, y, w, h = parsed
-            sx = ox + x / fw * dw
-            sy = oy + y / fh * dh
-            ex = ox + (x + w) / fw * dw
-            ey = oy + (y + h) / fh * dh
+            # multi boxes share the wide-pixel space of the single-track box, so
+            # FOV-map them the same way for a correct overlay on the tele feed
+            bn = self._box_wide_norm((x, y, w, h))
+            if bn is None:
+                continue
+            dnx, dny, dbw, dbh = self._wide_to_display(*bn)
+            if not (0.0 <= dnx <= 1.0 and 0.0 <= dny <= 1.0):
+                continue
+            sx = ox + (dnx - dbw / 2.0) * dw
+            sy = oy + (dny - dbh / 2.0) * dh
+            ex = ox + (dnx + dbw / 2.0) * dw
+            ey = oy + (dny + dbh / 2.0) * dh
             self.canvas.create_rectangle(sx, sy, ex, ey, outline="#22d3ee",
                                          width=2, tags="multibox")
             self.canvas.create_text(sx + 3, sy + 3, anchor=tk.NW, fill="#22d3ee",
@@ -1174,24 +1246,22 @@ class App:
             self._status(f"Keyboard jog: joy({jx:+.0f},{jy:+.0f})")
 
     def _drive_to_center(self) -> None:
-        box = self.ctl.state.get("track_box")
         ts = self.ctl.state.get("track_box_ts", 0.0)
-        fw, fh = self._frame_wh
         stale = (time.time() - ts) > BOX_STALE_S
-        lost = (not box or fw == 0 or box[0] <= TRACK_NO_TARGET
-                or box[1] <= TRACK_NO_TARGET or stale)
-        if lost:
+        bn = None if stale else self._box_wide_norm(self.ctl.state.get("track_box"))
+        if bn is None:
             if self._moving:
                 self.ctl.joystick_stop()
                 self._moving = False
             self._status("tracking: searching for target (no lock) — motors idle.")
             return
-        # Box coords are in stream pixels (== decoded frame size), so normalise
-        # the centring error against fw/fh.
-        x, y, w, h = box
-        bx, by = x + w / 2.0, y + h / 2.0
-        nx = (bx - fw / 2.0) / (fw / 2.0)
-        ny = (by - fh / 2.0) / (fh / 2.0)
+        # Error is the target's offset from the WIDE boresight (the box's own
+        # reference), independent of which feed is displayed — so auto-centre
+        # behaves the same on wide and tele and doesn't overshoot on tele's
+        # narrow FOV the way frame-relative normalisation did.
+        cx, cy, _, _ = bn
+        nx = (cx - 0.5) * 2.0
+        ny = (cy - 0.5) * 2.0
         jx = AZ_SIGN * self._axis_speed(nx)
         jy = ALT_SIGN * self._axis_speed(ny)
         if jx == 0.0 and jy == 0.0:
