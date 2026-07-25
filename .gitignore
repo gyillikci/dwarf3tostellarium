@@ -25,6 +25,11 @@ test_grab.py
 # Capture log (photo + IMU attitude records written by roi_gui)
 captures.jsonl
 
+# FTP-downloaded photos + sub-pixel match records/visuals (runtime output)
+captured_photos/
+match_log.ndjson
+reference.jpg
+
 # WitMotion Sun/Moon calibration produced at runtime
 wit_calibration.json
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ftplib
 import json
 import math
 import os
@@ -106,6 +107,23 @@ ALT_SIGN    = +1.0    # flip if altitude (up/down) correction goes wrong way
 # ALT_SIGN convention as the ROI-based corrections above so it stays consistent
 # with whatever those get tuned to.
 ARROW_KEY_SPEED = 30.0   # joystick magnitude while a key is held
+
+# ── ROI nudge (WASD) ────────────────────────────────────────────────────────────
+# Slide the *selection box* itself (not the mount) with W/A/S/D — separate keys
+# from the arrow-key jog above so both can be used independently (e.g. nudge the
+# box to correct for drift, then let it re-lock). Re-sending the track command on
+# every single keystroke while held (OS auto-repeat) would flood the device, so
+# the actual retrack is debounced to fire once, shortly after nudging stops.
+ROI_NUDGE_STEP_PX = 20     # frame pixels moved per keypress
+ROI_NUDGE_DEBOUNCE_MS = 150
+
+# ── Live photo matching ──────────────────────────────────────────────────────
+# Continuously matches the live tele feed against reference.jpg (same SIFT +
+# RANSAC pipeline as the one-shot Match button) and draws a crosshair where
+# the reference's center currently falls in the live view. SIFT on a full
+# 1920x1080 frame takes ~100-300ms, so this runs in a background thread,
+# throttled, with only one match in flight at a time — never every frame.
+LIVE_MATCH_INTERVAL_MS = 600
 
 # ── Direct slew tuning (Center-on-ROI) ────────────────────────────────────────
 # Drives the motors open-loop to bring the selected ROI centre to the frame
@@ -326,12 +344,32 @@ class App:
         self.ctl: DwarfLab | None = None
         self.grabber: FrameGrabber | None = None
         self.frame_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
+        # Secondary preview: always the OTHER camera (whichever isn't
+        # selected), read-only, shows the ROI projected across via FOV ratio.
+        self.grabber2: FrameGrabber | None = None
+        self.frame_q2: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
+        self._photo2: ImageTk.PhotoImage | None = None
+        self._disp2 = (0, 0, 0, 0)
+        self._frame_wh2 = (0, 0)
 
         # WitMotion IMU (optional, connected independently of the DWARF)
         self.wit: WitMonitor | None = None
         self.wit_address = wit_address
         self.wit_name = wit_name
         self.capture_log = "captures.jsonl"
+        self.photo_dir = "captured_photos"   # local folder for FTP-downloaded photos
+        self.last_photo_path: str | None = None   # most recently downloaded photo
+        self.reference_photo = "reference.jpg"     # principal photo to match against
+        self.match_log = "match_log.ndjson"
+        self._latest_frame: np.ndarray | None = None    # primary canvas's frame
+        self._latest_frame2: np.ndarray | None = None   # secondary canvas's frame
+        self._live_match_busy = False       # one match job in flight at a time
+        self._live_ref_kp = None            # cached reference SIFT (computed once)
+        self._live_ref_des = None
+        self._live_ref_shape: tuple[int, int] | None = None   # (h, w)
+        self._live_marker_id: int | None = None
+        self._live_ref_gray: np.ndarray | None = None   # cached reference pixels
+        self.match_win: tk.Toplevel | None = None        # popup: lines + timing + angle
 
         self.roi: tuple[int, int, int, int] | None = None   # frame-pixel ROI
         self._drag_start: tuple[int, int] | None = None      # canvas coords
@@ -343,6 +381,7 @@ class App:
         self._moving = False     # joystick currently commanded non-zero
         self._slewing = False    # a manual Center-on-ROI slew is in progress
         self._keys_down: set[str] = set()   # arrow keys currently held (keyboard jog)
+        self._roi_nudge_after_id: str | None = None   # pending debounced retrack
         # live diagnostics captured from the device notify stream (WS thread)
         self._diag = {
             "counts": defaultdict(int),
@@ -377,6 +416,10 @@ class App:
         for _key in ("Up", "Down", "Left", "Right"):
             cam.bind(f"<KeyPress-{_key}>", lambda _e, k=_key: self._jog_press_break(k))
             cam.bind(f"<KeyRelease-{_key}>", lambda _e, k=_key: self._jog_release_break(k))
+        # Same problem for W/A/S/D: readonly Combobox jumps to the option
+        # starting with that letter (type-ahead) unless we intercept first.
+        for _key in ("w", "a", "s", "d", "W", "A", "S", "D"):
+            cam.bind(f"<KeyPress-{_key}>", lambda _e, k=_key.lower(): self._roi_nudge_break(k))
 
         self.btn_connect = tk.Button(bar, text="Connect", width=11,
                                      command=self._toggle_connect)
@@ -471,6 +514,18 @@ class App:
             variable=self.wit_attach, fg="#ddd", bg="#1a1a1f",
             selectcolor="#1a1a1f", activebackground="#1a1a1f",
             activeforeground="#ddd").pack(side=tk.LEFT)
+        # Sub-pixel photo registration (reference.jpg vs the latest capture).
+        # Local-file-only, so it works whether or not the DWARF is connected.
+        self.btn_match = tk.Button(bar3, text="🎯 Match", width=10,
+                                   command=self._match_photos)
+        self.btn_match.pack(side=tk.LEFT, padx=(12, 0))
+        self.live_match_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            bar3, text="Live match (tele vs reference)",
+            variable=self.live_match_var, fg="#ddd", bg="#1a1a1f",
+            selectcolor="#1a1a1f", activebackground="#1a1a1f",
+            activeforeground="#ddd",
+            command=self._toggle_live_match).pack(side=tk.LEFT, padx=(8, 0))
 
         # IMU (WitMotion) connect — independent of the DWARF connection
         self.btn_wit = tk.Button(bar3, text="Connect WIT IMU", width=15,
@@ -479,16 +534,31 @@ class App:
         tk.Label(bar3, text="IMU:", fg="#ddd", bg="#1a1a1f").pack(
             side=tk.RIGHT, padx=(12, 2))
 
-        # -- video canvas --
-        self.canvas = tk.Canvas(root, bg="#0e0e12", highlightthickness=0,
+        # -- video canvases: primary (interactive) + secondary (other camera,
+        # read-only preview showing the ROI projected across via FOV ratio) --
+        video_row = tk.Frame(root, bg="#1a1a1f")
+        video_row.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        primary_col = tk.Frame(video_row, bg="#1a1a1f")
+        primary_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(primary_col, bg="#0e0e12", highlightthickness=0,
                                 cursor="crosshair")
-        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=4)
+        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.create_text(
             10, 10, anchor=tk.NW, fill="#888", tags="hint",
             text="No video — click Connect, then drag a box over the feed.")
+
+        secondary_col = tk.Frame(video_row, bg="#1a1a1f", width=360)
+        secondary_col.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0))
+        secondary_col.pack_propagate(False)
+        self.secondary_label_var = tk.StringVar(value="other camera")
+        tk.Label(secondary_col, textvariable=self.secondary_label_var,
+                 fg="#888", bg="#1a1a1f").pack(side=tk.TOP, anchor=tk.W)
+        self.canvas2 = tk.Canvas(secondary_col, bg="#0e0e12", highlightthickness=0)
+        self.canvas2.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         # -- status bar --
         self.status_var = tk.StringVar(
@@ -508,6 +578,12 @@ class App:
                  bg="#1c1c24", font=("Consolas", 9)).pack(
             side=tk.BOTTOM, fill=tk.X)
 
+        # -- live-match row (own line so it isn't overwritten by _status) --
+        self.live_match_status_var = tk.StringVar(value="Live match: off")
+        tk.Label(root, textvariable=self.live_match_status_var, anchor=tk.W,
+                 fg="#22d3ee", bg="#1c1c24", font=("Consolas", 9)).pack(
+            side=tk.BOTTOM, fill=tk.X)
+
         # Arrow-key keyboard jog. Bound on root (not the canvas) so it fires
         # regardless of which widget has focus, as long as no Entry/text
         # widget steals it — this GUI has none.
@@ -519,6 +595,11 @@ class App:
         # Safety net: if the window loses focus while a key is held, no
         # KeyRelease ever fires and the motor would keep running — force-stop.
         root.bind("<FocusOut>", lambda _e: self._on_arrow_focus_lost())
+
+        # WASD: slide the ROI selection box itself (not the mount).
+        for _key in ("w", "a", "s", "d"):
+            root.bind(f"<KeyPress-{_key}>", lambda _e, k=_key: self._roi_nudge(k))
+
         root.focus_set()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -526,6 +607,7 @@ class App:
         self.root.after(LOOP_MS, self._control_tick)
         self.root.after(300, self._diag_tick)
         self.root.after(200, self._wit_tick)
+        self.root.after(LIVE_MATCH_INTERVAL_MS, self._live_match_tick)
 
     # -- status (updates a Tk variable; safe to call from worker threads) --
     def _status(self, msg: str) -> None:
@@ -537,6 +619,15 @@ class App:
 
     def _rtsp_url(self) -> str:
         return f"rtsp://{self.ip}/{CAMERAS[self.cam_var.get()]}/stream0"
+
+    def _is_wide_selected(self) -> bool:
+        return CAMERAS.get(self.cam_var.get()) == "ch1"
+
+    def _other_camera_ch(self) -> str:
+        return "ch0" if self._is_wide_selected() else "ch1"
+
+    def _secondary_rtsp_url(self) -> str:
+        return f"rtsp://{self.ip}/{self._other_camera_ch()}/stream0"
 
     # ── connect / disconnect ─────────────────────────────────────────────────
     def _toggle_connect(self) -> None:
@@ -583,9 +674,25 @@ class App:
         # CAPTURE-VERIFIED V3 bring-up (the app's order). This is what arms the
         # firmware so 14800 actually locks. NOTE: open wide with an EMPTY payload
         # (v3_open_wide) — {1:1} = CLOSE and knocks the device offline.
+        #
+        # 14800 TRACK_START_TRACK has no camera-select field at all, yet the app
+        # clearly gets it to lock tele vs wide correctly (capture-verified: tele's
+        # NOTIFY channel roamed with every drag while wide's sat frozen on a static
+        # blob the whole session). The firmware must be inferring the target
+        # camera from open/mode state — and the app's own capture (coldstart
+        # test) showed it toggling close+reopen ending with whichever camera the
+        # user had just switched to opened LAST. Unconditionally opening
+        # tele-then-wide every time (old code) always left wide "freshest",
+        # which would silently route every track to wide regardless of what's
+        # selected — open whichever camera is currently selected last instead.
+        is_wide = CAMERAS.get(self.cam_var.get()) == "ch1"
         self.ctl.v3_mode_switch(1)     # 16404 {3:{1:1}}
-        self.ctl.v3_open_tele(1)       # 10050 {1:1}
-        self.ctl.v3_open_wide()        # 12036 (empty) = open
+        if is_wide:
+            self.ctl.v3_open_tele(1)       # 10050 {1:1}
+            self.ctl.v3_open_wide()        # 12036 (empty) = open — selected, last
+        else:
+            self.ctl.v3_open_wide()        # 12036 (empty) = open
+            self.ctl.v3_open_tele(1)       # 10050 {1:1} — selected, last
 
     def _disconnect(self) -> None:
         self._stop_stream()
@@ -620,11 +727,19 @@ class App:
         self._stop_stream()
         self.grabber = FrameGrabber(self._rtsp_url(), self.frame_q, self._status)
         self.grabber.start()
+        self.grabber2 = FrameGrabber(self._secondary_rtsp_url(), self.frame_q2,
+                                     self._status)
+        self.grabber2.start()
+        other = "Tele (ch0)" if self._is_wide_selected() else "Wide (ch1)"
+        self.secondary_label_var.set(f"{other} — projected ROI")
 
     def _stop_stream(self) -> None:
         if self.grabber is not None:
             self.grabber.stop()
             self.grabber = None
+        if self.grabber2 is not None:
+            self.grabber2.stop()
+            self.grabber2 = None
 
     def _switch_camera(self) -> None:
         if self.ctl is None:
@@ -640,9 +755,16 @@ class App:
             frame = None
         if frame is not None:
             self._show_frame(frame)
+        try:
+            frame2 = self.frame_q2.get_nowait()
+        except queue.Empty:
+            frame2 = None
+        if frame2 is not None:
+            self._show_frame2(frame2)
         self.root.after(30, self._poll_frame)
 
     def _show_frame(self, frame: np.ndarray) -> None:
+        self._latest_frame = frame   # cached for live-match background thread
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
         fh, fw = frame.shape[:2]
@@ -664,6 +786,54 @@ class App:
         self._draw_multi_boxes(ox, oy, dw, dh, fw, fh)
         if self._rect_id is not None:
             self.canvas.tag_raise(self._rect_id)
+
+    def _project_roi(self, roi: tuple[int, int, int, int], from_wide: bool,
+                     target_fw: int, target_fh: int) -> tuple[float, float, float, float]:
+        """Project an ROI drawn in one camera's frame into the other's,
+        assuming both share a boresight and scaling by the published FOV
+        ratio (TELE_FOV_DEG/WIDE_FOV_DEG — approximate, not capture-verified,
+        same caveat as the Center-on-ROI slew tuning). Tele has a much
+        narrower FOV, so the same physical box is much LARGER in tele-frame
+        pixels than in wide-frame pixels."""
+        x, y, w, h = roi
+        src_fw, src_fh = self._frame_wh
+        scale = (WIDE_FOV_DEG / TELE_FOV_DEG) if from_wide else (TELE_FOV_DEG / WIDE_FOV_DEG)
+        cx, cy = src_fw / 2.0, src_fh / 2.0
+        bx, by = x + w / 2.0, y + h / 2.0
+        pcx = target_fw / 2.0 + (bx - cx) * scale
+        pcy = target_fh / 2.0 + (by - cy) * scale
+        pw, ph = w * scale, h * scale
+        return (pcx - pw / 2.0, pcy - ph / 2.0, pw, ph)
+
+    def _show_frame2(self, frame: np.ndarray) -> None:
+        self._latest_frame2 = frame   # cached for live-match (tele-only target)
+        cw = max(1, self.canvas2.winfo_width())
+        ch = max(1, self.canvas2.winfo_height())
+        fh, fw = frame.shape[:2]
+        self._frame_wh2 = (fw, fh)
+        scale = min(cw / fw, ch / fh)
+        dw, dh = max(1, int(fw * scale)), max(1, int(fh * scale))
+        ox, oy = (cw - dw) // 2, (ch - dh) // 2
+        self._disp2 = (ox, oy, dw, dh)
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb).resize((dw, dh))
+        self._photo2 = ImageTk.PhotoImage(img)
+        self.canvas2.delete("video2")
+        self.canvas2.create_image(ox, oy, anchor=tk.NW, image=self._photo2,
+                                  tags="video2")
+        self.canvas2.tag_lower("video2")
+
+        self.canvas2.delete("projbox")
+        if self.roi is not None and self._frame_wh[0] > 0 and fw > 0:
+            px, py, pw, ph = self._project_roi(
+                self.roi, self._is_wide_selected(), fw, fh)
+            sx = ox + px / fw * dw
+            sy = oy + py / fh * dh
+            ex = ox + (px + pw) / fw * dw
+            ey = oy + (py + ph) / fh * dh
+            self.canvas2.create_rectangle(sx, sy, ex, ey, outline="#22d3ee",
+                                          width=2, dash=(4, 2), tags="projbox")
 
     def _draw_track_box(self, ox, oy, dw, dh, fw, fh) -> None:
         """Overlay the live (morphing) box the firmware is tracking, in green.
@@ -795,8 +965,11 @@ class App:
             self._clear_roi()
             return
         self.roi = (x, y, w, h)
-        self._status(f"ROI selected: x={x} y={y} w={w} h={h} — "
-                     "press 'Center on ROI' to slew the mount there.")
+        if self.ctl is not None:
+            self._start_track()   # auto-start tracking as soon as the box is set
+        else:
+            self._status(f"ROI selected: x={x} y={y} w={w} h={h} — "
+                         "Connect first to start tracking.")
 
     def _clear_roi(self) -> None:
         self.roi = None
@@ -813,6 +986,57 @@ class App:
         if self._rect_id is not None:
             self.canvas.delete(self._rect_id)
             self._rect_id = None
+
+    # ── ROI nudge (WASD) ─────────────────────────────────────────────────────
+    def _roi_nudge_break(self, key: str) -> str:
+        """Same as _roi_nudge, but returns 'break' so a focused widget's own
+        bindings (e.g. Combobox type-ahead) don't also fire."""
+        self._roi_nudge(key)
+        return "break"
+
+    def _roi_nudge(self, key: str) -> None:
+        if self.roi is None:
+            return
+        fw, fh = self._frame_wh
+        if fw == 0:
+            return
+        # Sync to the firmware's own live tracked box first, if fresh — nudge
+        # should correct the ACTUAL current lock, not the stale mouse-drawn
+        # rectangle from whenever the box was first drawn.
+        if self.ctl is not None:
+            box = self.ctl.state.get("track_box")
+            ts = self.ctl.state.get("track_box_ts", 0.0)
+            if (box and box[0] > TRACK_NO_TARGET and box[1] > TRACK_NO_TARGET
+                    and (time.time() - ts) <= BOX_STALE_S):
+                self.roi = box
+        x, y, w, h = self.roi
+        dx = {"a": -1, "d": 1}.get(key, 0) * ROI_NUDGE_STEP_PX
+        dy = {"w": -1, "s": 1}.get(key, 0) * ROI_NUDGE_STEP_PX
+        x = max(0, min(fw - w, x + dx))
+        y = max(0, min(fh - h, y + dy))
+        self.roi = (x, y, w, h)
+        ox, oy, dw, dh = self._disp
+        sx = ox + x / fw * dw
+        sy = oy + y / fh * dh
+        ex = ox + (x + w) / fw * dw
+        ey = oy + (y + h) / fh * dh
+        if self._rect_id is not None:
+            self.canvas.coords(self._rect_id, sx, sy, ex, ey)
+        else:
+            self._rect_id = self.canvas.create_rectangle(
+                sx, sy, ex, ey, outline="#22d3ee", width=2, dash=(5, 3))
+        self._status(f"ROI nudged: x={x} y={y} w={w} h={h}")
+        # Debounce the actual retrack so holding a key doesn't flood the
+        # device with a track-start command on every OS key-repeat tick.
+        if self._roi_nudge_after_id is not None:
+            self.root.after_cancel(self._roi_nudge_after_id)
+        self._roi_nudge_after_id = self.root.after(
+            ROI_NUDGE_DEBOUNCE_MS, self._roi_nudge_retrack)
+
+    def _roi_nudge_retrack(self) -> None:
+        self._roi_nudge_after_id = None
+        if self.ctl is not None and self.roi is not None:
+            self._start_track()
 
     # ── tracking ─────────────────────────────────────────────────────────────
     def _start_track(self) -> None:
@@ -1107,11 +1331,21 @@ class App:
 
     # ── closed-loop motor control ─────────────────────────────────────────
     @staticmethod
-    def _axis_speed(n: float) -> float:
-        """Proportional speed for one axis from normalised error n in [-1, 1]."""
+    def _axis_speed(n: float, gain_scale: float = 1.0) -> float:
+        """Proportional speed for one axis from normalised error n in [-1, 1].
+
+        gain_scale shrinks GAIN/MAX_SPEED for tele's narrow FOV (same ratio as
+        the Center-on-ROI slew). MIN_SPEED is NOT scaled — it's the mount's
+        real mechanical stiction floor, independent of which camera is
+        selected. Never scaling it down means every non-deadzone tele error
+        still gets a full-strength MIN_SPEED pulse; _drive_to_center handles
+        that by only holding it for a fraction of the tick (duty-cycling)
+        instead of the whole LOOP_MS, mirroring the slew's speed/duration split.
+        """
         if abs(n) < DEADZONE:
             return 0.0
-        s = max(-MAX_SPEED, min(MAX_SPEED, GAIN * n))
+        max_speed = MAX_SPEED * gain_scale
+        s = max(-max_speed, min(max_speed, GAIN * gain_scale * n))
         if 0 < abs(s) < MIN_SPEED:
             s = MIN_SPEED if s > 0 else -MIN_SPEED
         return s
@@ -1192,8 +1426,11 @@ class App:
         bx, by = x + w / 2.0, y + h / 2.0
         nx = (bx - fw / 2.0) / (fw / 2.0)
         ny = (by - fh / 2.0) / (fh / 2.0)
-        jx = AZ_SIGN * self._axis_speed(nx)
-        jy = ALT_SIGN * self._axis_speed(ny)
+        is_wide = CAMERAS.get(self.cam_var.get()) == "ch1"
+        gain_scale = 1.0 if is_wide else TELE_SLEW_SCALE ** TELE_SLEW_SPEED_EXP
+        hold_scale = 1.0 if is_wide else TELE_SLEW_SCALE ** (1.0 - TELE_SLEW_SPEED_EXP)
+        jx = AZ_SIGN * self._axis_speed(nx, gain_scale)
+        jy = ALT_SIGN * self._axis_speed(ny, gain_scale)
         if jx == 0.0 and jy == 0.0:
             if self._moving:
                 self.ctl.joystick_stop()
@@ -1202,48 +1439,119 @@ class App:
         else:
             self.ctl.joystick(jx, jy)
             self._moving = True
-            self._status(
-                f"tracking: correcting err({nx:+.2f},{ny:+.2f}) "
-                f"joy({jx:+.0f},{jy:+.0f})")
+            if is_wide:
+                self._status(
+                    f"tracking: correcting err({nx:+.2f},{ny:+.2f}) "
+                    f"joy({jx:+.0f},{jy:+.0f})")
+            else:
+                # Duty-cycle: MIN_SPEED isn't scaled down (it's the real
+                # stiction floor), so holding it for the full LOOP_MS tick
+                # would still overshoot tele's narrow FOV — only hold for a
+                # tele-scaled fraction of the tick, then stop early.
+                hold_ms = max(10, int(LOOP_MS * hold_scale))
+                self.root.after(hold_ms, self._tele_tick_stop)
+                self._status(
+                    f"tracking: correcting err({nx:+.2f},{ny:+.2f}) "
+                    f"joy({jx:+.0f},{jy:+.0f}) tele-hold {hold_ms}ms")
+
+    def _tele_tick_stop(self) -> None:
+        if self.ctl is not None and self._moving:
+            self.ctl.joystick_stop()
+            self._moving = False
 
     # ── capture (telephoto photo + IMU attitude snapshot) ────────────────────
     def _capture_photo(self) -> None:
-        """Trigger a telephoto still on the DWARF and log it together with the
-        current WitMotion IMU attitude.
+        """Trigger a telephoto still on the DWARF, download it off the SD card
+        via FTP (vsFTPd runs on :21, no credentials needed — confirmed by
+        direct test), and log it with the mount attitude at the shutter instant.
 
         The photo command (CMD_CAMERA_TELE_PHOTOGRAPH / 10002) is telephoto-only,
-        so it captures the tele lens regardless of which feed is previewed. The
-        JPEG is written to the device's own storage; here we record a timestamped
-        line in captures.jsonl with the mount attitude at the shutter instant.
+        so it captures the tele lens regardless of which feed is previewed.
+        Runs in a background thread (FTP + file I/O); reads the wit_attach Tk
+        variable here on the main thread first since Python 3.12 raises if a
+        background thread touches Tk state directly (see _status's comment).
         """
         if self.ctl is None:
             self._status("Connect to the DWARF first.")
             return
+        attach_imu = self.wit_attach.get()
+        self._status("Taking tele photo…")
+        threading.Thread(target=self._capture_photo_worker, args=(attach_imu,),
+                         daemon=True).start()
+
+    def _capture_photo_worker(self, attach_imu: bool) -> None:
+        ftp = None
+        before = None
+        try:
+            ftp = ftplib.FTP()
+            ftp.connect(self.ip, 21, timeout=8)
+            ftp.login()
+            ftp.cwd("Normal_Photos")
+            before = set(ftp.nlst())
+        except Exception as exc:
+            self._status(f"Photo: FTP unavailable ({exc}) — taking shutter only.")
+
         self.ctl.take_photo()                       # CMD_CAMERA_TELE_PHOTOGRAPH
+        shutter_time = datetime.now(timezone.utc)
+
+        new_name = None
+        local_path = None
+        if ftp is not None and before is not None:
+            deadline = time.time() + 12.0
+            while time.time() < deadline and new_name is None:
+                time.sleep(1.0)
+                try:
+                    added = set(ftp.nlst()) - before
+                except Exception:
+                    break
+                if added:
+                    new_name = sorted(added)[-1]   # newest if several appeared
+            if new_name:
+                try:
+                    os.makedirs(self.photo_dir, exist_ok=True)
+                    local_path = os.path.join(self.photo_dir, new_name)
+                    with open(local_path, "wb") as fh:
+                        ftp.retrbinary(f"RETR {new_name}", fh.write)
+                    self.last_photo_path = local_path
+                except Exception as exc:
+                    self._status(f"Photo taken, but FTP download failed: {exc}")
+                    local_path = None
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+
         rec = {
-            "timestamp": datetime.now(timezone.utc).isoformat(
-                timespec="milliseconds"),
+            "timestamp": shutter_time.isoformat(timespec="milliseconds"),
             "camera": "tele",
             "cmd": "CMD_CAMERA_TELE_PHOTOGRAPH(10002)",
         }
+        if new_name:
+            rec["device_filename"] = new_name
+        if local_path:
+            rec["local_path"] = local_path
         att = None
-        if self.wit_attach.get() and self.wit is not None and self.wit.connected:
+        if attach_imu and self.wit is not None and self.wit.connected:
             att = self.wit.snapshot()
             if att is not None:
                 rec["imu"] = att
         self._log_capture(rec)
-        if att is not None and att.get("calibrated"):
-            self._status(
-                f"📷 Tele photo taken (saved on device). IMU alt={att['altitude']:+.3f}° "
-                f"az={att['azimuth']:.3f}° → {self.capture_log}")
-        elif att is not None:
-            self._status(
-                f"📷 Tele photo taken (saved on device). IMU roll={att['roll']:+.3f} "
-                f"pitch={att['pitch']:+.3f} yaw={att['yaw']:+.3f} → {self.capture_log}")
+
+        if local_path:
+            base = f"📷 Tele photo saved: {local_path}"
+        elif new_name:
+            base = f"📷 Tele photo taken ({new_name}) — FTP download failed, still on device."
         else:
-            self._status(
-                "📷 Tele photo taken (saved on device). No IMU attitude recorded "
-                "(connect the WIT IMU to capture angles).")
+            base = ("📷 Tele photo taken (saved on device) — couldn't find the "
+                    "new file over FTP within 12s.")
+        if att is not None and att.get("calibrated"):
+            self._status(f"{base}  IMU alt={att['altitude']:+.3f}° "
+                         f"az={att['azimuth']:.3f}°")
+        elif att is not None:
+            self._status(f"{base}  IMU roll={att['roll']:+.3f} "
+                         f"pitch={att['pitch']:+.3f} yaw={att['yaw']:+.3f}")
+        else:
+            self._status(f"{base} (no IMU attitude — connect WIT IMU to capture angles).")
 
     def _log_capture(self, rec: dict) -> None:
         try:
@@ -1251,6 +1559,382 @@ class App:
                 fh.write(json.dumps(rec) + "\n")
         except Exception as exc:
             self._status(f"Photo taken but capture-log write failed: {exc}")
+
+    # ── photo matching (sub-pixel registration vs a reference photo) ─────────
+    def _find_reference_photo(self) -> str | None:
+        for c in (self.reference_photo,
+                 os.path.join(self.photo_dir, self.reference_photo)):
+            if os.path.isfile(c):
+                return c
+        return None
+
+    def _find_latest_photo(self) -> str | None:
+        try:
+            files = [os.path.join(self.photo_dir, f)
+                    for f in os.listdir(self.photo_dir)
+                    if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                    and f != "match_result.jpg"]
+        except FileNotFoundError:
+            return None
+        return max(files, key=os.path.getmtime) if files else None
+
+    def _match_photos(self) -> None:
+        """Sub-pixel registration: reference.jpg vs the most recent capture,
+        via SIFT features + a RANSAC-fit similarity transform (translation +
+        rotation + uniform scale). Local-file-only — works with or without
+        the DWARF connected. Runs in a background thread (SIFT on a 4K image
+        isn't instant)."""
+        ref_path = self._find_reference_photo()
+        if ref_path is None:
+            self._status(f"Match: no reference photo — place one at "
+                         f"'{self.reference_photo}' (repo dir or "
+                         f"{self.photo_dir}/) first.")
+            return
+        latest_path = self.last_photo_path
+        if latest_path is None or not os.path.isfile(latest_path):
+            latest_path = self._find_latest_photo()
+        if latest_path is None:
+            self._status(f"Match: no photo found in '{self.photo_dir}/' — "
+                         "take one with Capture first.")
+            return
+        if os.path.abspath(latest_path) == os.path.abspath(ref_path):
+            self._status("Match: latest capture IS the reference photo — "
+                         "take a new one first.")
+            return
+        self._status(f"Matching {os.path.basename(latest_path)} against "
+                     f"{os.path.basename(ref_path)}…")
+        threading.Thread(target=self._match_photos_worker,
+                         args=(ref_path, latest_path), daemon=True).start()
+
+    def _match_photos_worker(self, ref_path: str, latest_path: str) -> None:
+        ref = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
+        cur = cv2.imread(latest_path, cv2.IMREAD_GRAYSCALE)
+        if ref is None or cur is None:
+            self._status("Match: failed to load one of the images.")
+            return
+
+        sift = cv2.SIFT_create()
+        kp1, des1 = sift.detectAndCompute(ref, None)
+        kp2, des2 = sift.detectAndCompute(cur, None)
+        if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+            self._status("Match: not enough SIFT features detected "
+                         "(low-contrast or featureless image?).")
+            return
+
+        bf = cv2.BFMatcher(cv2.NORM_L2)
+        knn = bf.knnMatch(des1, des2, k=2)
+        good = [m for m, n in knn if m.distance < 0.75 * n.distance]  # Lowe's ratio
+        if len(good) < 4:
+            self._status(f"Match: only {len(good)} good feature matches "
+                         "(need >= 4 for a fit) — images may not overlap.")
+            return
+
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+        # RANSAC-fit similarity transform (translation + rotation + uniform
+        # scale — no perspective term, since both photos are from the same
+        # fixed optical setup). Fitting over many correspondences yields a
+        # sub-pixel-accurate translation even though each individual SIFT
+        # keypoint is only pixel-ish precise — the same principle astrometric
+        # plate-solving relies on for centroid accuracy.
+        M, inlier_mask = cv2.estimateAffinePartial2D(
+            src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0,
+            maxIters=5000, confidence=0.995)
+        if M is None:
+            self._status("Match: RANSAC found no consistent transform "
+                         "(images may not actually overlap).")
+            return
+
+        n_inliers = int(inlier_mask.sum()) if inlier_mask is not None else 0
+        dx, dy = float(M[0, 2]), float(M[1, 2])
+        scale = float(math.hypot(M[0, 0], M[1, 0]))
+        rot_deg = float(math.degrees(math.atan2(M[1, 0], M[0, 0])))
+
+        lines_path, overlay_path = self._save_match_visuals(
+            ref_path, latest_path, ref, cur, kp1, kp2, good, inlier_mask, M)
+
+        rec = {
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "reference": ref_path, "latest": latest_path,
+            "matches_total": len(good), "inliers": n_inliers,
+            "dx_px": round(dx, 4), "dy_px": round(dy, 4),
+            "rotation_deg": round(rot_deg, 5), "scale": round(scale, 6),
+            "match_lines_image": lines_path, "overlay_image": overlay_path,
+        }
+        try:
+            with open(self.match_log, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
+
+        self._status(
+            f"🎯 Match: dx={dx:+.3f}px dy={dy:+.3f}px rot={rot_deg:+.4f}° "
+            f"scale={scale:.5f}  ({n_inliers}/{len(good)} inliers)"
+            + (f"  → {overlay_path}" if overlay_path else ""))
+
+    def _save_match_visuals(self, ref_path, latest_path, ref, cur, kp1, kp2,
+                            good, inlier_mask, M):
+        """Two diagnostic images, both downscaled to something actually
+        legible (the raw full-res drawMatches plot with 1000+ lines is just
+        visual noise):
+          match_lines.jpg   — a small SAMPLE of inlier match lines only.
+          match_overlay.jpg — reference in the red channel, the latest photo
+                               WARPED onto the reference's frame in the green
+                               channel. Well-aligned content reads as
+                               grey/yellow; misaligned edges fringe red/green
+                               — much more direct evidence of fit quality
+                               than a line plot.
+        """
+        os.makedirs(self.photo_dir, exist_ok=True)
+        lines_path = overlay_path = None
+
+        try:
+            mask = inlier_mask.ravel().tolist() if inlier_mask is not None else None
+            inliers = [m for m, keep in zip(good, mask) if keep] if mask else good
+            sample = inliers[:: max(1, len(inliers) // 40)][:40]   # ~40 lines, evenly spread
+            vis = cv2.drawMatches(
+                ref, kp1, cur, kp2, sample, None,
+                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+            vh, vw = vis.shape[:2]
+            target_w = 1600
+            if vw > target_w:
+                vis = cv2.resize(vis, (target_w, int(vh * target_w / vw)))
+            lines_path = os.path.join(self.photo_dir, "match_lines.jpg")
+            cv2.imwrite(lines_path, vis)
+        except Exception:
+            lines_path = None
+
+        try:
+            M_inv = cv2.invertAffineTransform(M)
+            warped_cur = cv2.warpAffine(cur, M_inv, (ref.shape[1], ref.shape[0]))
+            overlay = np.zeros((*ref.shape, 3), dtype=np.uint8)
+            overlay[..., 2] = ref          # red   = reference
+            overlay[..., 1] = warped_cur   # green = latest, warped to align
+            oh, ow = overlay.shape[:2]
+            target_w = 1600
+            if ow > target_w:
+                overlay = cv2.resize(overlay, (target_w, int(oh * target_w / ow)))
+            overlay_path = os.path.join(self.photo_dir, "match_overlay.jpg")
+            cv2.imwrite(overlay_path, overlay)
+        except Exception:
+            overlay_path = None
+
+        return lines_path, overlay_path
+
+    # ── live matching (tele feed vs reference.jpg, continuous) ───────────────
+    def _set_live_status(self, msg: str) -> None:
+        # Called from the background match thread — Python 3.12 raises if Tk
+        # state is touched off the main thread, same as _status().
+        self.root.after(0, lambda: self.live_match_status_var.set(msg))
+
+    def _toggle_live_match(self) -> None:
+        if not self.live_match_var.get():
+            self.live_match_status_var.set("Live match: off")
+            self._clear_live_marker()
+            self._live_ref_kp = None
+            self._live_ref_des = None
+            self._live_ref_shape = None
+            self._live_ref_gray = None
+            return
+        ref_path = self._find_reference_photo()
+        if ref_path is None:
+            self.live_match_var.set(False)
+            self._status(f"Live match: no reference photo — place one at "
+                         f"'{self.reference_photo}' first.")
+            return
+        ref = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
+        if ref is None:
+            self.live_match_var.set(False)
+            self._status(f"Live match: failed to load {ref_path}.")
+            return
+        sift = cv2.SIFT_create()
+        kp, des = sift.detectAndCompute(ref, None)
+        if des is None or len(kp) < 4:
+            self.live_match_var.set(False)
+            self._status("Live match: not enough SIFT features in the "
+                         "reference photo.")
+            return
+        # Cached once here — only the live frame needs re-detecting each tick.
+        self._live_ref_kp = kp
+        self._live_ref_des = des
+        self._live_ref_shape = ref.shape   # (h, w)
+        self._live_ref_gray = ref
+        self.live_match_status_var.set(
+            f"Live match: on ({os.path.basename(ref_path)}) — searching…")
+        self._ensure_match_window()
+
+    def _get_tele_frame(self) -> tuple[np.ndarray | None, bool]:
+        """Always returns the TELE stream's frame, regardless of which camera
+        is currently selected as primary — live match targets tele always.
+        Returns (frame, is_primary) so the crosshair lands on whichever
+        canvas is actually showing tele right now (primary or the secondary
+        preview pane)."""
+        if self._is_wide_selected():
+            return self._latest_frame2, False   # tele is the secondary pane
+        return self._latest_frame, True         # tele is the primary pane
+
+    def _live_match_tick(self) -> None:
+        tele_frame, is_primary = self._get_tele_frame()
+        ready = (self.live_match_var.get() and not self._live_match_busy
+                and self._live_ref_des is not None and tele_frame is not None)
+        if ready:
+            self._live_match_busy = True
+            threading.Thread(target=self._live_match_worker,
+                             args=(tele_frame, is_primary), daemon=True).start()
+        self.root.after(LIVE_MATCH_INTERVAL_MS, self._live_match_tick)
+
+    def _live_match_worker(self, frame: np.ndarray, is_primary: bool) -> None:
+        t0 = time.time()
+
+        def elapsed_ms() -> float:
+            return (time.time() - t0) * 1000.0
+
+        try:
+            cur = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            sift = cv2.SIFT_create()
+            kp2, des2 = sift.detectAndCompute(cur, None)
+            if des2 is None or len(kp2) < 4:
+                self._set_live_status(
+                    f"Live match: no features in current frame ({elapsed_ms():.0f}ms)")
+                self.root.after(0, self._clear_live_marker)
+                return
+
+            bf = cv2.BFMatcher(cv2.NORM_L2)
+            knn = bf.knnMatch(self._live_ref_des, des2, k=2)
+            good = [m for m, n in knn if m.distance < 0.75 * n.distance]
+            if len(good) < 4:
+                self._set_live_status(
+                    f"Live match: only {len(good)} matches — no lock "
+                    f"({elapsed_ms():.0f}ms)")
+                self.root.after(0, self._clear_live_marker)
+                return
+
+            src_pts = np.float32(
+                [self._live_ref_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst_pts = np.float32(
+                [kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            M, inlier_mask = cv2.estimateAffinePartial2D(
+                src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0,
+                maxIters=2000, confidence=0.99)
+            if M is None:
+                self._set_live_status(
+                    f"Live match: RANSAC found no consistent transform — "
+                    f"no lock ({elapsed_ms():.0f}ms)")
+                self.root.after(0, self._clear_live_marker)
+                return
+
+            n_inliers = int(inlier_mask.sum()) if inlier_mask is not None else 0
+            dx, dy = float(M[0, 2]), float(M[1, 2])
+            scale = float(math.hypot(M[0, 0], M[1, 0]))
+            rot_deg = float(math.degrees(math.atan2(M[1, 0], M[0, 0])))
+
+            # Where does the reference frame's CENTER land in the current
+            # live frame? That's the crosshair target to slew/nudge toward.
+            ref_h, ref_w = self._live_ref_shape
+            ref_cx, ref_cy = ref_w / 2.0, ref_h / 2.0
+            cur_x = M[0, 0] * ref_cx + M[0, 1] * ref_cy + M[0, 2]
+            cur_y = M[1, 0] * ref_cx + M[1, 1] * ref_cy + M[1, 2]
+
+            total_ms = elapsed_ms()
+            self._set_live_status(
+                f"Live match: dx={dx:+.2f}px dy={dy:+.2f}px "
+                f"rot={rot_deg:+.3f}° scale={scale:.4f} "
+                f"({n_inliers}/{len(good)} inliers, {total_ms:.0f}ms)")
+            self.root.after(0, lambda: self._draw_live_marker(cur_x, cur_y, is_primary))
+
+            # Small sampled match-lines image for the popup window — built
+            # here (background thread; pure numpy/cv2, no Tk) then handed to
+            # the main thread to convert to a PhotoImage and display.
+            vis = self._build_match_lines_thumb(
+                self._live_ref_gray, self._live_ref_kp, cur, kp2, good, inlier_mask)
+            self.root.after(0, lambda: self._update_match_window(
+                vis, total_ms, rot_deg, dx, dy, n_inliers, len(good)))
+        except Exception as exc:
+            self._set_live_status(f"Live match: error ({exc}) ({elapsed_ms():.0f}ms)")
+        finally:
+            self._live_match_busy = False
+
+    def _build_match_lines_thumb(self, ref, ref_kp, cur, cur_kp, good, inlier_mask):
+        """Small in-memory (no disk write — this runs every ~600ms) match-lines
+        image: reference | current, with a sampled set of inlier lines."""
+        mask = inlier_mask.ravel().tolist() if inlier_mask is not None else None
+        inliers = [m for m, keep in zip(good, mask) if keep] if mask else good
+        sample = inliers[:: max(1, len(inliers) // 30)][:30]
+        vis = cv2.drawMatches(ref, ref_kp, cur, cur_kp, sample, None,
+                              flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+        vh, vw = vis.shape[:2]
+        target_w = 760
+        if vw > target_w:
+            vis = cv2.resize(vis, (target_w, int(vh * target_w / vw)))
+        return vis
+
+    def _draw_live_marker(self, fx: float, fy: float, is_primary: bool) -> None:
+        """Crosshair, in canvas coords, at the live-frame pixel where the
+        reference photo's center currently falls — main-thread only (canvas).
+        Drawn on whichever canvas is actually showing tele right now."""
+        canvas = self.canvas if is_primary else self.canvas2
+        fw, fh = self._frame_wh if is_primary else self._frame_wh2
+        disp = self._disp if is_primary else self._disp2
+        canvas.delete("livematch")
+        if fw == 0:
+            return
+        ox, oy, dw, dh = disp
+        sx = ox + fx / fw * dw
+        sy = oy + fy / fh * dh
+        r = 14
+        canvas.create_line(sx - r, sy, sx + r, sy, fill="#22d3ee",
+                           width=2, tags="livematch")
+        canvas.create_line(sx, sy - r, sx, sy + r, fill="#22d3ee",
+                           width=2, tags="livematch")
+        canvas.create_oval(sx - r, sy - r, sx + r, sy + r,
+                           outline="#22d3ee", width=2, tags="livematch")
+
+    def _clear_live_marker(self) -> None:
+        self.canvas.delete("livematch")
+        self.canvas2.delete("livematch")
+
+    # ── match details popup window ────────────────────────────────────────
+    def _ensure_match_window(self) -> None:
+        if self.match_win is not None and self.match_win.winfo_exists():
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Match Details")
+        win.configure(bg="#1a1a1f")
+        win.geometry("800x540")
+        self.match_win = win
+        self.match_win_canvas = tk.Canvas(win, bg="#0e0e12", highlightthickness=0)
+        self.match_win_canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True,
+                                   padx=6, pady=6)
+        info = tk.Frame(win, bg="#1a1a1f")
+        info.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 8))
+        self.match_win_time_var = tk.StringVar(value="Match time: —")
+        self.match_win_angle_var = tk.StringVar(value="Relative angle: —")
+        self.match_win_offset_var = tk.StringVar(value="Offset: —")
+        for var in (self.match_win_time_var, self.match_win_angle_var,
+                   self.match_win_offset_var):
+            tk.Label(info, textvariable=var, fg="#ddd", bg="#1a1a1f",
+                    font=("Consolas", 10)).pack(side=tk.LEFT, padx=(0, 20))
+        self._match_win_photo = None   # keep a reference alive
+
+        def _on_close():
+            win.destroy()
+            self.match_win = None
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _update_match_window(self, vis_bgr, elapsed_ms, rot_deg, dx, dy,
+                             n_inliers, n_good) -> None:
+        self._ensure_match_window()
+        rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+        self._match_win_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.match_win_canvas.delete("vis")
+        self.match_win_canvas.create_image(0, 0, anchor=tk.NW,
+                                           image=self._match_win_photo, tags="vis")
+        self.match_win_time_var.set(f"Match time: {elapsed_ms:.0f} ms")
+        self.match_win_angle_var.set(f"Relative angle: {rot_deg:+.4f}°")
+        self.match_win_offset_var.set(
+            f"Offset: dx={dx:+.2f}px dy={dy:+.2f}px  ({n_inliers}/{n_good} inliers)")
 
     # ── WitMotion IMU (attitude capture) ─────────────────────────────────────
     def _toggle_wit(self) -> None:

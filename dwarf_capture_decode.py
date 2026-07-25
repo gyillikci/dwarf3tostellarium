@@ -263,9 +263,26 @@ def extract_streams(path: str, port: int):
 
 
 # ── WebSocket frame walker ─────────────────────────────────────────────────────
+def http_prefix_end(data: bytes) -> int:
+    """Both directions of the :9900 stream open with a plaintext HTTP/1.1
+    handshake (client GET .../ Upgrade request, server 101 Switching
+    Protocols response) before WS framing begins. Without skipping it,
+    iter_ws_frames misreads the ASCII header bytes as bogus frame headers.
+    On a long stream it can accidentally self-resync a few frames in (why
+    device->phone often "worked"); on a short stream (few real WS frames
+    after the handshake) it runs out of bytes first and yields nothing —
+    silently dropping every phone->device request. Returns the offset just
+    past the terminating "\\r\\n\\r\\n", or 0 if this doesn't look like HTTP.
+    """
+    if len(data) < 4 or data[0] not in (0x47, 0x48):   # 'G' (GET) or 'H' (HTTP)
+        return 0
+    idx = data.find(b"\r\n\r\n", 0, 8192)
+    return idx + 4 if idx != -1 else 0
+
+
 def iter_ws_frames(stream: bytes):
     """Yield (opcode, payload) for each WebSocket frame in a TCP byte stream."""
-    pos, n = 0, len(stream)
+    pos, n = http_prefix_end(stream), len(stream)
     while pos + 2 <= n:
         b0, b1 = stream[pos], stream[pos + 1]; pos += 2
         op = b0 & 0x0F
