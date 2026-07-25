@@ -169,6 +169,41 @@ BORESIGHT_DY = 0.0
 # been shown once; replaced with the real decoded size as soon as wide renders.
 WIDE_REF_WH = (1920, 1080)
 
+# ── Client-side tele tracker (OpenCV) ─────────────────────────────────────────
+# The firmware only runs its detector on the WIDE camera (the tele notify 15225
+# stays empty), so its "tele tracking" is really wide tracking and can only
+# centre to the wide camera's coarse resolution — the wide DEADZONE (±1.8°) is
+# wider than the whole tele FOV (±1.7°), so the target can sit at the tele edge
+# and the loop still calls it centred. For fine tele centring we run our OWN
+# OpenCV object tracker on the tele frame and drive the motors from tele-pixel
+# error, which is ~17x finer. These are tele-native, so they normalise against
+# the displayed (tele) frame directly — tune on-device.
+CV_DEADZONE    = 0.02    # |error| (fraction of half-frame) treated as centred
+CV_GAIN        = 55.0    # proportional gain: error(-1..1) -> joystick units
+CV_MAX_SPEED   = 40.0    # clamp joystick magnitude per axis
+CV_MIN_SPEED   = 9.0     # minimum command to overcome motor stiction
+CV_BOX_STALE_S = 0.7     # treat the CV box as lost after this without an update
+
+
+def _make_cv_tracker():
+    """Return a fresh OpenCV single-object tracker, or None if the build has no
+    tracker (CSRT/KCF/MIL live in opencv-python ≥4.5.1; older/contrib builds
+    expose them under cv2.legacy). Preference order: CSRT (accurate) → KCF
+    (fast) → MIL (last resort)."""
+    for factory in (
+        "TrackerCSRT_create", "legacy.TrackerCSRT_create",
+        "TrackerKCF_create", "legacy.TrackerKCF_create",
+        "TrackerMIL_create",
+    ):
+        obj = cv2
+        try:
+            for part in factory.split("."):
+                obj = getattr(obj, part)
+            return obj()
+        except Exception:
+            continue
+    return None
+
 # ── Sentinel/UFO auto-track profiles ──────────────────────────────────────────
 # Firmware auto-detects + drives its own motors in these modes. The `mode` int
 # in ReqStartSentryMode selects the detection profile. Exact codes are not in
@@ -369,6 +404,12 @@ class App:
         self._moving = False     # joystick currently commanded non-zero
         self._slewing = False    # a manual Center-on-ROI slew is in progress
         self._keys_down: set[str] = set()   # arrow keys currently held (keyboard jog)
+        # Client-side OpenCV tele tracker (fine centring on the tele frame)
+        self._cv_track = False
+        self._cv_tracker = None             # cv2 tracker object
+        self._cv_box = None                 # (x, y, w, h) in tele-frame pixels
+        self._cv_box_ts = 0.0
+        self._last_frame = None             # most recent raw BGR frame (tracker I/O)
         # live diagnostics captured from the device notify stream (WS thread)
         self._diag = {
             "counts": defaultdict(int),
@@ -414,6 +455,9 @@ class App:
         self.btn_track = tk.Button(bar, text="Start Track ROI", width=14,
                                    state=tk.DISABLED, command=self._start_track)
         self.btn_track.pack(side=tk.RIGHT)
+        self.btn_cv = tk.Button(bar, text="Tele CV Track", width=13,
+                                state=tk.DISABLED, command=self._start_cv_track)
+        self.btn_cv.pack(side=tk.RIGHT, padx=4)
         self.btn_ai = tk.Button(bar, text="AI Track (MOT)", width=13,
                                 state=tk.DISABLED, command=self._start_ai_track)
         self.btn_ai.pack(side=tk.RIGHT, padx=4)
@@ -599,6 +643,7 @@ class App:
         self.btn_center.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.NORMAL)
         self.btn_capture.config(state=tk.NORMAL)
+        self.btn_cv.config(state=tk.NORMAL)
         for b in self.mode_btns.values():
             b.config(state=tk.NORMAL)
         self.btn_auto_stop.config(state=tk.NORMAL)
@@ -620,6 +665,7 @@ class App:
         self._stop_stream()
         self._tracking = False
         self._slewing = False
+        self._stop_cv_track()
         if self.ctl is not None:
             try:
                 if self._moving:
@@ -637,6 +683,7 @@ class App:
         self.btn_center.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.DISABLED)
         self.btn_capture.config(state=tk.DISABLED)
+        self.btn_cv.config(state=tk.DISABLED)
         for b in self.mode_btns.values():
             b.config(state=tk.DISABLED)
         self.btn_auto_stop.config(state=tk.DISABLED)
@@ -658,6 +705,10 @@ class App:
     def _switch_camera(self) -> None:
         if self.ctl is None:
             return
+        if self._cv_track and self._current_cam() != "tele":
+            # the CV tracker is bound to the tele image; drop it off-tele
+            self._stop_cv_track()
+            self._status("Left the tele feed — CV track stopped.")
         self._open_camera()
         self._start_stream()
 
@@ -676,8 +727,11 @@ class App:
         ch = max(1, self.canvas.winfo_height())
         fh, fw = frame.shape[:2]
         self._frame_wh = (fw, fh)
+        self._last_frame = frame
         if self._current_cam() == "wide":
             self._wide_wh = (fw, fh)   # cache the true wide-box reference size
+        if self._cv_track and self._cv_tracker is not None:
+            self._update_cv_tracker(frame)
         scale = min(cw / fw, ch / fh)
         dw, dh = max(1, int(fw * scale)), max(1, int(fh * scale))
         ox, oy = (cw - dw) // 2, (ch - dh) // 2
@@ -693,6 +747,7 @@ class App:
         self.canvas.tag_lower("video")
         self._draw_track_box(ox, oy, dw, dh, fw, fh)
         self._draw_multi_boxes(ox, oy, dw, dh, fw, fh)
+        self._draw_cv_box(ox, oy, dw, dh, fw, fh)
         if self._rect_id is not None:
             self.canvas.tag_raise(self._rect_id)
 
@@ -723,6 +778,78 @@ class App:
             dny = 0.5 + (cy - 0.5 - BORESIGHT_DY) * m
             return dnx, dny, bw * m, bh * m
         return cx, cy, bw, bh
+
+    # ── client-side tele tracker (OpenCV) ────────────────────────────────────
+    def _start_cv_track(self) -> None:
+        """Lock an OpenCV tracker onto the selected ROI in the tele frame and
+        drive the motors from tele-pixel error (fine centring the firmware's
+        wide-only detector can't give)."""
+        if self.ctl is None:
+            self._status("Connect first.")
+            return
+        if self._current_cam() != "tele":
+            self._status("Switch to the Tele (ch0) feed before CV tracking.")
+            return
+        if self.roi is None:
+            self._status("Drag a box over the target on the tele feed first.")
+            return
+        if self._last_frame is None:
+            self._status("No video yet — wait for the tele feed.")
+            return
+        tracker = _make_cv_tracker()
+        if tracker is None:
+            self._status("OpenCV object trackers unavailable in this OpenCV build.")
+            return
+        x, y, w, h = self.roi   # tele-frame pixels (ROI is in the displayed feed)
+        try:
+            tracker.init(self._last_frame, (int(x), int(y), int(w), int(h)))
+        except Exception as exc:
+            self._status(f"CV tracker init failed: {exc}")
+            return
+        # hand over from the firmware tracker so the two don't fight the motors
+        self._tracking = False
+        self._mot = False
+        self._cv_tracker = tracker
+        self._cv_box = (int(x), int(y), int(w), int(h))
+        self._cv_box_ts = time.time()
+        self._cv_track = True
+        self._hide_roi_rect()
+        self._status("Tele CV track started — centring from the tele image.")
+
+    def _update_cv_tracker(self, frame) -> None:
+        """Advance the OpenCV tracker on the latest tele frame (main thread)."""
+        try:
+            ok, box = self._cv_tracker.update(frame)
+        except Exception:
+            ok, box = False, None
+        if ok and box is not None:
+            x, y, w, h = box
+            self._cv_box = (int(x), int(y), int(w), int(h))
+            self._cv_box_ts = time.time()
+        else:
+            self._cv_box = None   # lost this frame; _drive_cv_center idles motors
+
+    def _stop_cv_track(self) -> None:
+        self._cv_track = False
+        self._cv_tracker = None
+        self._cv_box = None
+        self.canvas.delete("cvbox")
+
+    def _draw_cv_box(self, ox, oy, dw, dh, fw, fh) -> None:
+        """Draw the client-side tele tracker box (magenta). It is in tele-frame
+        pixels, so it maps 1:1 to the displayed feed — no FOV transform."""
+        self.canvas.delete("cvbox")
+        if not self._cv_track or self._cv_box is None or fw == 0:
+            return
+        if (time.time() - self._cv_box_ts) > CV_BOX_STALE_S:
+            return
+        x, y, w, h = self._cv_box
+        sx = ox + x / fw * dw
+        sy = oy + y / fh * dh
+        ex = ox + (x + w) / fw * dw
+        ey = oy + (y + h) / fh * dh
+        self.canvas.create_rectangle(sx, sy, ex, ey, outline="#ff3df5",
+                                     width=2, tags="cvbox")
 
     def _draw_track_box(self, ox, oy, dw, dh, fw, fh) -> None:
         """Overlay the live (morphing) box the firmware is tracking, in green.
@@ -891,6 +1018,7 @@ class App:
         if self.ctl is None or self.roi is None:
             self._status("Select a ROI first (drag on the video).")
             return
+        self._stop_cv_track()   # hand back to the firmware tracker
         # self.roi is already in stream-pixel space (the decoded RTSP frame IS the
         # wide stream, ~1920x1080). start_track_roi() appends the CAPTURE-VERIFIED
         # 5th field (=1) the app sends; together with the V3 camera bring-up done
@@ -921,6 +1049,7 @@ class App:
         if self.ctl is None:
             self._status("Connect first.")
             return
+        self._stop_cv_track()
         self.ctl.set_master_lock(True)
         cam = CAMERAS.get(self.cam_var.get())
         self.ctl.wide_tele_track_switch(1 if cam == "ch1" else 0)  # enable detector
@@ -932,6 +1061,7 @@ class App:
     def _stop_track(self) -> None:
         self._tracking = False
         self._mot = False
+        self._stop_cv_track()
         self._multi_disp = []
         self.canvas.delete("multibox")
         if self.ctl is not None:
@@ -1192,9 +1322,9 @@ class App:
         if self._slewing or self._keys_down:
             self.root.after(LOOP_MS, self._control_tick)
             return
-        active = (self._tracking and self.loop_var.get()
-                  and self.ctl is not None)
-        if active:
+        if self._cv_track and self.loop_var.get() and self.ctl is not None:
+            self._drive_cv_center()          # client-side tele tracker takes priority
+        elif self._tracking and self.loop_var.get() and self.ctl is not None:
             self._drive_to_center()
         elif self._moving and self.ctl is not None:
             self.ctl.joystick_stop()
@@ -1244,6 +1374,45 @@ class App:
             self.ctl.joystick(jx, jy)
             self._moving = True
             self._status(f"Keyboard jog: joy({jx:+.0f},{jy:+.0f})")
+
+    @staticmethod
+    def _cv_axis_speed(n: float) -> float:
+        """Proportional speed for the tele CV tracker (its own, tighter tuning)."""
+        if abs(n) < CV_DEADZONE:
+            return 0.0
+        s = max(-CV_MAX_SPEED, min(CV_MAX_SPEED, CV_GAIN * n))
+        if 0 < abs(s) < CV_MIN_SPEED:
+            s = CV_MIN_SPEED if s > 0 else -CV_MIN_SPEED
+        return s
+
+    def _drive_cv_center(self) -> None:
+        """Keep the OpenCV-tracked target centred in the TELE frame. The box is
+        tele-native, so the error normalises against the displayed frame."""
+        box = self._cv_box
+        fw, fh = self._frame_wh
+        stale = (time.time() - self._cv_box_ts) > CV_BOX_STALE_S
+        if box is None or fw == 0 or stale:
+            if self._moving:
+                self.ctl.joystick_stop()
+                self._moving = False
+            self._status("CV track: target lost — motors idle (re-select a ROI).")
+            return
+        x, y, w, h = box
+        nx = (x + w / 2.0 - fw / 2.0) / (fw / 2.0)
+        ny = (y + h / 2.0 - fh / 2.0) / (fh / 2.0)
+        jx = AZ_SIGN * self._cv_axis_speed(nx)
+        jy = ALT_SIGN * self._cv_axis_speed(ny)
+        if jx == 0.0 and jy == 0.0:
+            if self._moving:
+                self.ctl.joystick_stop()
+                self._moving = False
+            self._status(f"CV track: centred (err {nx:+.2f},{ny:+.2f}) — holding.")
+        else:
+            self.ctl.joystick(jx, jy)
+            self._moving = True
+            self._status(
+                f"CV track: correcting err({nx:+.2f},{ny:+.2f}) "
+                f"joy({jx:+.0f},{jy:+.0f})")
 
     def _drive_to_center(self) -> None:
         ts = self.ctl.state.get("track_box_ts", 0.0)

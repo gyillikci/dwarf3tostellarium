@@ -267,3 +267,25 @@ time lag simply looks ~17× larger through the tele FOV.
 Known follow-up: dragging a *new* ROI while the tele feed is shown still sends
 tele-frame pixels to the firmware (which expects wide pixels); start ROI/AI
 tracking from the wide feed until that inverse mapping is added.
+
+---
+
+## Fine tele centring: a client-side OpenCV tracker
+
+The confirmation that `tele#` (`15225`) never populates while `wide#` (`15252`)
+streams — even with the tele feed shown and tracking active — means the firmware
+has **no tele-resolution tracker**: all "tele tracking" is the wide detector
+plus a slew. Its centring precision is therefore bounded by the wide camera and
+the `DEADZONE`: at `DEADZONE=0.06` and a 60° wide FOV, "centred" is ±1.8° of
+pointing error, but the tele FOV is only ±1.7° — so the wide loop can stop with
+the target parked at (or past) the tele edge.
+
+`roi_gui.py` adds a **client-side tele tracker** for real tele precision: drag a
+box over the target on the tele feed and **Tele CV Track** seeds an OpenCV
+tracker (`_make_cv_tracker`, CSRT→KCF→MIL) on the tele frame. `_update_cv_tracker`
+advances it each frame; `_drive_cv_center` drives the motors from tele-pixel
+error with its own tighter `CV_*` tuning (`CV_DEADZONE=0.02`). Because this box is
+tele-native it normalises against the displayed frame directly (no FOV map), and
+it takes priority over the firmware loop in `_control_tick`. It is bound to the
+tele image: switching feeds, Stop Track, or disconnect all end it. `CV_*` are
+best-effort and want on-device tuning; RTSP latency still applies.

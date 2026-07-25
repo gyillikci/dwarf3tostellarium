@@ -76,6 +76,18 @@ lets you trigger a still and record the mount attitude:
   taken and the IMU is connected, the current attitude (angles, and calibrated
   alt/az if available) is stored in the `captures.jsonl` record for that photo.
 
+- **Tele CV Track** — fine target-centring on the **tele** feed. The firmware's
+  detector only runs on the wide camera (the tele notify stays empty), so its
+  "tele tracking" is really wide tracking and can only centre to the wide
+  camera's coarse resolution — the wide dead-zone (±1.8°) is wider than the whole
+  tele FOV (±1.7°), so the target can sit at the tele edge and still be called
+  "centred". This button instead runs an OpenCV object tracker on the tele image:
+  switch to Tele (ch0), drag a box over the target, click **Tele CV Track**, and
+  the mount is driven from tele-pixel error (~17× finer). The tracked box is
+  drawn in magenta. Stop Track (or leaving the tele feed) ends it. Needs an
+  OpenCV build with the object trackers (CSRT/KCF/MIL — in `opencv-python`
+  ≥4.5.1). The `CV_*` tuning constants at the top of `roi_gui.py` are best-effort.
+
 Optionally pin the sensor so it connects without scanning:
 
     python3 roi_gui.py --ip 192.168.1.102 --wit-address AA:BB:CC:DD:EE:FF
