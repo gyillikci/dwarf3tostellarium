@@ -243,10 +243,18 @@ to anchor, GMS to propagate cheaply between solves.
 2. **Calibrate the wide camera:** recover `K` + Brown–Conrady coefficients for
    the wide lens (and tele) from real frames. This is the single biggest
    accuracy lever.
-3. **Prototype `platesolve.py` (Option A):** centroid (opencv) → undistort
-   (`cv2.undistortPoints`) → LOS → triad/k-vector match against a
-   magnitude-limited Hipparcos subset (or `tetra3`) → Wahba/SVD → RA/Dec.
-   Validate against step 1 on the same frames.
+3. **Prototype `platesolve.py` (Option A) — DONE (see the module in this repo).**
+   Pure-Python port of the SONIC pipeline: `CameraModel` (K/Kinv + Brown-Conrady),
+   `Centroider.COB`-equivalent center-of-brightness detection, a sorted
+   inter-star-angle pair table (the k-vector idea), the `StarId.interstarAngle`
+   triad matcher, and `wahba_svd` (Markley's SVD, identical to SONIC). numpy is
+   the only hard dep; opencv/scipy are optional and only for centroiding a real
+   image. A false-triad **confirmation gate** (`confirm_frac`) was added on top
+   of SONIC's `min_matches` floor after the synthetic test surfaced spurious
+   locks in dense fields. `python3 platesolve.py` runs a self-contained synthetic
+   end-to-end test (no Hipparcos data / no real frame): 20/20 solves, worst
+   attitude error 17″. Still TODO: validate against real DWARF frames + SONIC
+   (step 1) and wire in a real catalog (`StarCatalog.load_hipparcos_vizier`).
 4. **Wire results into `captures.jsonl`, `server.py` (`/api/solve`, `/api/sync`),
    and `wit_imu.py` (`--calibrate-stars`).**
 5. **Layer GMS** for relative registration/stacking between absolute solves.
