@@ -139,6 +139,17 @@ SLEW_MIN_OFF   = 0.04   # ignore tiny offsets (already centred)
 # them verbatim for tele way overshoots (mount keeps slewing long after the
 # target has left the tele frame). Best-effort published-spec values — retune
 # here if the mount over/undershoots.
+#
+# CORRECTION FOUND (2026-07-26, from DwarfLab's own shoot_plan_config.json,
+# the "DWARF3" entry's cameras[].fvWidth/fvHeight — authoritative, not a
+# guess): real horizontal FOV is Tele=3.188 deg, Wide=43.292 deg. WIDE_FOV_DEG
+# below is ~39% too high (60 vs the real 43.292), which meaningfully changes
+# TELE_SLEW_SCALE (0.0567 now vs the real 0.0736). NOT applied here on
+# purpose: TELE_SLEW_SPEED_EXP was empirically tuned live against the CURRENT
+# (wrong) ratio, and this constant feeds directly into real motor-slew speed/
+# duration math (see below) — changing it changes live slew behavior in a way
+# that can't be verified without retesting on the mount. Apply + retest
+# TELE_SLEW_SPEED_EXP together before trusting the corrected ratio.
 TELE_FOV_DEG = 3.4
 WIDE_FOV_DEG = 60.0
 TELE_SLEW_SCALE = TELE_FOV_DEG / WIDE_FOV_DEG   # total angle to move, relative to wide
@@ -334,6 +345,322 @@ class WitMonitor:
         return rec
 
 
+# ── Live stacking popup (tele only) ────────────────────────────────────────────
+# Real-time "quick look" stacking, in the spirit of SharpCap/ASIAIR live-stack
+# previews: every incoming frame is aligned to the first frame of the session
+# (translation only, via cv2.phaseCorrelate) and blended into a running float
+# average. Static/faint detail builds up and gets less noisy over time; fast
+# movers (satellites, planes, ROI drift beyond STACK_MAX_SHIFT_PX) just streak
+# or fade rather than derailing the whole stack. This is deliberately NOT a
+# rotation/scale-aware or plate-solved stacker — good enough for a live preview
+# over a short session, not for final astrophotos (use the real capture +
+# on-device stacking mode for that).
+#
+# Always opens its own dedicated RTSP grabber on ch0/tele, independent of
+# whatever camera is selected in the main window (same "never competes with
+# the control channel" rationale as ListenOnlyApp — this reads video only).
+# The tele camera still has to be *opened* by someone via the WsCmd control
+# channel before ch0's RTSP endpoint serves any frames; if the main window
+# isn't connected yet, this window will just sit on "opening ... " status.
+#
+# All the CV work (phase correlation, accumulation, percentile stretch) runs
+# in a background StackWorker thread, NOT the Tk main thread — a Toplevel
+# shares the same event loop as the main tracker window, so anything slow
+# done per-frame here previously stalled the *entire* app, not just this
+# popup. Two more tricks keep it cheap even on tele's full-res frames:
+# alignment is computed on a downsampled copy (FFT cost scales with pixel
+# count) and the shift scaled back up, and the rendered preview is only
+# refreshed a few times a second, not on every incoming frame — the Tk side
+# just polls a 1-deep "latest preview" queue, so it never does more than
+# blit whatever's already been computed.
+STACK_POLL_MS = 60             # how often the Tk side checks for a new preview
+STACK_RENDER_INTERVAL_S = 0.35  # how often the worker actually renders one
+STACK_ALIGN_SCALE = 0.35        # alignment computed at this fraction of full res
+STACK_MAX_SHIFT_PX = 80          # in full-res pixels; reject anything larger
+                                 # (treat as a bad match rather than smearing
+                                 # the whole stack toward garbage)
+
+
+class StackWorker(threading.Thread):
+    """Background thread doing all the per-frame work for LiveStackWindow.
+
+    Pulls raw frames from `in_q` (fed by a FrameGrabber), aligns + accumulates
+    them at full resolution, and pushes a rendered uint8 preview into `out_q`
+    (maxsize=1, latest-only) at STACK_RENDER_INTERVAL_S — never on every
+    frame. `paused`/`stretch` are plain attributes flipped from the Tk thread;
+    simple bool/None assignment is atomic enough here (same pattern as
+    WitMonitor's `_latest` elsewhere in this file), not worth a lock for a
+    live-preview toggle.
+    """
+
+    def __init__(self, in_q: "queue.Queue[np.ndarray]",
+                 out_q: "queue.Queue[tuple]", status_cb) -> None:
+        super().__init__(daemon=True)
+        self._in_q = in_q
+        self._out_q = out_q
+        self._status = status_cb
+        self._running = True
+        self.paused = False
+        self.stretch = True
+        self._reset_requested = False
+
+        self._ref_gray: np.ndarray | None = None
+        self._hann: np.ndarray | None = None
+        self._accum: np.ndarray | None = None   # float32 HxWx3 running sum
+        self._last_gray: np.ndarray | None = None   # latest single frame, for the raw-noise readout
+        self.count = 0
+        self.t0 = time.time()
+        self._last_render = 0.0
+
+    def request_reset(self) -> None:
+        self._reset_requested = True
+
+    @staticmethod
+    def _noise_metric(gray: np.ndarray) -> float:
+        """Rough, target-agnostic noise estimate: std of the high-frequency
+        residual (image minus a heavily blurred copy of itself). Averaging
+        down real photon/read noise should make this drop roughly as
+        1/sqrt(frame count); a bright, already-clean frame will show almost
+        no drop since there's very little noise to remove in the first
+        place — this number is how you tell "is stacking doing anything"
+        objectively rather than by eye, which the auto-stretch can mask."""
+        sample = gray[::2, ::2].astype(np.float32)
+        blurred = cv2.GaussianBlur(sample, (0, 0), sigmaX=2.0)
+        return float(np.std(sample - blurred))
+
+    def snapshot_full(self):
+        """Current full-res accumulated average as uint8 BGR, or None —
+        used by Save. Reads self._accum/count without a lock; a save landing
+        mid-accumulate is a one-frame cosmetic risk, not worth synchronizing."""
+        if self._accum is None or self.count == 0:
+            return None
+        return self._to_uint8(self._accum / self.count, self.stretch)
+
+    @staticmethod
+    def _to_uint8(avg: np.ndarray, stretch: bool) -> np.ndarray:
+        if stretch:
+            # Percentile on a coarse subsample, not the full array — np.percentile
+            # is a partial-sort and doing it on a full 1920x1080x3 frame is itself
+            # a meaningful chunk of the per-render cost; every-4th-pixel is visually
+            # indistinguishable for a preview stretch.
+            sample = avg[::4, ::4]
+            lo = float(np.percentile(sample, 1.0))
+            hi = float(np.percentile(sample, 99.5))
+            if hi <= lo:
+                hi = lo + 1.0
+            avg = np.clip((avg - lo) * (255.0 / (hi - lo)), 0, 255)
+        return avg.astype(np.uint8)
+
+    def _align_shift(self, gray: np.ndarray) -> tuple[float, float]:
+        """Translation of `gray` relative to the session reference frame, via
+        phase correlation computed on a downsampled copy (cheap FFT), scaled
+        back to full-res pixels. Returns (0, 0) — treat as unshifted rather
+        than smear the stack — if the match looks unreliable or too large."""
+        h, w = gray.shape
+        sw = max(8, int(w * STACK_ALIGN_SCALE))
+        sh = max(8, int(h * STACK_ALIGN_SCALE))
+        try:
+            small = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+            ref_small = cv2.resize(self._ref_gray, (sw, sh),
+                                   interpolation=cv2.INTER_AREA)
+            if self._hann is None or self._hann.shape != (sh, sw):
+                self._hann = cv2.createHanningWindow((sw, sh), cv2.CV_32F)
+            (dx, dy), response = cv2.phaseCorrelate(
+                np.float32(ref_small), np.float32(small), self._hann)
+        except Exception:
+            return 0.0, 0.0
+        dx, dy = dx / STACK_ALIGN_SCALE, dy / STACK_ALIGN_SCALE
+        if response < 0.05 or abs(dx) > STACK_MAX_SHIFT_PX or abs(dy) > STACK_MAX_SHIFT_PX:
+            return 0.0, 0.0
+        return dx, dy
+
+    def _integrate(self, frame: np.ndarray) -> None:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._last_gray = gray
+        h, w = gray.shape
+        if (self._ref_gray is None or self._accum is None
+                or self._accum.shape[:2] != (h, w)):
+            self._ref_gray = gray
+            self._accum = frame.astype(np.float32)
+            self.count = 1
+        else:
+            dx, dy = self._align_shift(gray)
+            aligned = frame if (dx == 0.0 and dy == 0.0) else cv2.warpAffine(
+                frame, np.float32([[1, 0, dx], [0, 1, dy]]), (w, h))
+            self._accum += aligned.astype(np.float32)
+            self.count += 1
+
+    def run(self) -> None:
+        while self._running:
+            try:
+                frame = self._in_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if self._reset_requested:
+                self._ref_gray = None
+                self._accum = None
+                self._hann = None
+                self.count = 0
+                self.t0 = time.time()
+                self._reset_requested = False
+                self._status("Stack reset — next frame becomes the new reference.")
+            if self.paused:
+                continue
+            self._integrate(frame)
+            now = time.time()
+            if now - self._last_render >= STACK_RENDER_INTERVAL_S:
+                self._last_render = now
+                avg = self._accum / self.count
+                img8 = self._to_uint8(avg, self.stretch)
+                raw_noise = self._noise_metric(self._last_gray)
+                stack_noise = self._noise_metric(cv2.cvtColor(
+                    avg.astype(np.uint8), cv2.COLOR_BGR2GRAY))
+                try:
+                    while True:
+                        self._out_q.get_nowait()
+                except queue.Empty:
+                    pass
+                self._out_q.put((img8, self.count, now - self.t0,
+                                 raw_noise, stack_noise))
+
+    def stop(self) -> None:
+        self._running = False
+
+
+class LiveStackWindow:
+    def __init__(self, root: tk.Tk, ip: str, photo_dir: str = "captured_photos") -> None:
+        self.ip = ip
+        self.photo_dir = photo_dir
+        self._closed = False
+        self._photo: ImageTk.PhotoImage | None = None
+
+        self.win = tk.Toplevel(root)
+        self.win.title(f"DWARF 3 — Live Stack (Tele, {ip})")
+        self.win.geometry("880x680")
+        self.win.configure(bg="#1a1a1f")
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        bar = tk.Frame(self.win, bg="#1a1a1f")
+        bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
+        self.btn_pause = tk.Button(bar, text="Pause", width=9,
+                                   command=self._toggle_pause)
+        self.btn_pause.pack(side=tk.LEFT)
+        tk.Button(bar, text="Reset Stack", width=11,
+                 command=self._reset).pack(side=tk.LEFT, padx=6)
+        tk.Button(bar, text="💾 Save", width=9,
+                 command=self._save).pack(side=tk.LEFT, padx=(0, 12))
+        self.stretch_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            bar, text="Auto-stretch preview", variable=self.stretch_var,
+            fg="#ddd", bg="#1a1a1f", selectcolor="#1a1a1f",
+            activebackground="#1a1a1f", activeforeground="#ddd",
+            command=self._on_stretch_toggle).pack(side=tk.LEFT, padx=(0, 12))
+        self.info_var = tk.StringVar(value="frames stacked: 0   elapsed: 0.0s")
+        tk.Label(bar, textvariable=self.info_var, fg="#8fdcff", bg="#1a1a1f",
+                font=("Consolas", 10)).pack(side=tk.RIGHT)
+
+        self.canvas = tk.Canvas(self.win, bg="#0e0e12", highlightthickness=0)
+        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8,
+                         pady=(0, 8))
+        self.canvas.create_text(
+            10, 10, anchor=tk.NW, fill="#888", tags="hint",
+            text="Waiting for the tele stream ...")
+
+        # Objective proof stacking is doing something, independent of how it
+        # looks: noise (std of the high-frequency residual) for the latest
+        # single frame vs. the running stack. Should trend down as frame
+        # count grows on a real noisy/faint target; on an already-clean
+        # bright/daytime scene it will barely move — that's correct, not
+        # broken, there's very little noise there to remove.
+        self.noise_var = tk.StringVar(
+            value="noise (raw vs stacked): —   (a real drop needs a dim, "
+                 "noisy target — a bright daytime frame has little to gain)")
+        tk.Label(self.win, textvariable=self.noise_var, anchor=tk.W,
+                fg="#ffd479", bg="#1c1c24", font=("Consolas", 9)).pack(
+            side=tk.BOTTOM, fill=tk.X)
+
+        self.status_var = tk.StringVar(value="opening tele stream ...")
+        tk.Label(self.win, textvariable=self.status_var, anchor=tk.W,
+                fg="#bbb", bg="#26262e", font=("Consolas", 9)).pack(
+            side=tk.BOTTOM, fill=tk.X)
+
+        self._raw_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
+        self._preview_q: "queue.Queue[tuple]" = queue.Queue(maxsize=1)
+        self._grabber = FrameGrabber(f"rtsp://{ip}/ch0/stream0", self._raw_q,
+                                    self._status)
+        self._grabber.start()
+        self._worker = StackWorker(self._raw_q, self._preview_q, self._status)
+        self._worker.start()
+        self.win.after(STACK_POLL_MS, self._tick)
+
+    def _status(self, msg: str) -> None:
+        # Called from the FrameGrabber/StackWorker threads — marshal onto the
+        # Tk thread, same reasoning as App._status.
+        self.win.after(0, lambda: self.status_var.set(msg))
+
+    def _toggle_pause(self) -> None:
+        self._worker.paused = not self._worker.paused
+        self.btn_pause.config(text="Resume" if self._worker.paused else "Pause")
+
+    def _reset(self) -> None:
+        self._worker.request_reset()
+
+    def _on_stretch_toggle(self) -> None:
+        self._worker.stretch = self.stretch_var.get()
+
+    def _save(self) -> None:
+        img8 = self._worker.snapshot_full()
+        if img8 is None:
+            self.status_var.set("Nothing to save yet.")
+            return
+        os.makedirs(self.photo_dir, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.photo_dir,
+                            f"livestack_tele_{ts}_n{self._worker.count}.png")
+        cv2.imwrite(path, img8)
+        self.status_var.set(f"Saved {path}")
+
+    def _render(self, img8: np.ndarray, count: int, elapsed: float,
+               raw_noise: float, stack_noise: float) -> None:
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        fh, fw = img8.shape[:2]
+        scale = min(cw / fw, ch / fh)
+        dw, dh = max(1, int(fw * scale)), max(1, int(fh * scale))
+        ox, oy = (cw - dw) // 2, (ch - dh) // 2
+        rgb = cv2.cvtColor(img8, cv2.COLOR_BGR2RGB)
+        self._photo = ImageTk.PhotoImage(Image.fromarray(rgb).resize((dw, dh)))
+        self.canvas.delete("hint")
+        self.canvas.delete("stack")
+        self.canvas.create_image(ox, oy, anchor=tk.NW, image=self._photo,
+                                 tags="stack")
+        self.info_var.set(f"frames stacked: {count}   elapsed: {elapsed:.1f}s")
+        if raw_noise > 1e-6:
+            pct = 100.0 * (1.0 - stack_noise / raw_noise)
+            self.noise_var.set(
+                f"noise (raw vs stacked): {raw_noise:.2f} → {stack_noise:.2f} "
+                f"({pct:+.0f}%, n={count})")
+        else:
+            self.noise_var.set("noise (raw vs stacked): —")
+
+    def _tick(self) -> None:
+        if self._closed:
+            return
+        try:
+            img8, count, elapsed, raw_noise, stack_noise = self._preview_q.get_nowait()
+        except queue.Empty:
+            img8 = None
+        if img8 is not None:
+            self._render(img8, count, elapsed, raw_noise, stack_noise)
+        self.win.after(STACK_POLL_MS, self._tick)
+
+    def _on_close(self) -> None:
+        self._closed = True
+        self._worker.stop()
+        self._grabber.stop()
+        self.win.destroy()
+
+
 # ── Main application ──────────────────────────────────────────────────────────
 class App:
     def __init__(self, root: tk.Tk, ip: str,
@@ -361,6 +688,7 @@ class App:
         self.last_photo_path: str | None = None   # most recently downloaded photo
         self.reference_photo = "reference.jpg"     # principal photo to match against
         self.match_log = "match_log.ndjson"
+        self.stack_win: LiveStackWindow | None = None    # popup: live tele stacking
         self._latest_frame: np.ndarray | None = None    # primary canvas's frame
         self._latest_frame2: np.ndarray | None = None   # secondary canvas's frame
         self._live_match_busy = False       # one match job in flight at a time
@@ -526,6 +854,9 @@ class App:
             selectcolor="#1a1a1f", activebackground="#1a1a1f",
             activeforeground="#ddd",
             command=self._toggle_live_match).pack(side=tk.LEFT, padx=(8, 0))
+        self.btn_stack = tk.Button(bar3, text="✨ Live Stack (Tele)", width=17,
+                                   command=self._open_live_stack)
+        self.btn_stack.pack(side=tk.LEFT, padx=(12, 0))
 
         # IMU (WitMotion) connect — independent of the DWARF connection
         self.btn_wit = tk.Button(bar3, text="Connect WIT IMU", width=15,
@@ -835,6 +1166,24 @@ class App:
             self.canvas2.create_rectangle(sx, sy, ex, ey, outline="#22d3ee",
                                           width=2, dash=(4, 2), tags="projbox")
 
+    def _live_track_box(self):
+        """Return (box, ts) from the track-box notify channel matching the
+        CURRENTLY SELECTED camera (tele 15225 vs wide 15252), or (None, 0.0).
+
+        The firmware runs both cameras' correlation trackers concurrently, and
+        both write into the same controller state key (last-writer-wins) —
+        without this filter, a stray/no-target report from the OTHER camera's
+        channel intermittently blanks or corrupts the box for whichever camera
+        is actually selected (this was hiding the tele overlay entirely).
+        """
+        if self.ctl is None:
+            return None, 0.0
+        src = self.ctl.state.get("track_box_src")
+        is_wide = CAMERAS.get(self.cam_var.get()) == "ch1"
+        if src != ("wide" if is_wide else "tele"):
+            return None, 0.0
+        return self.ctl.state.get("track_box"), self.ctl.state.get("track_box_ts", 0.0)
+
     def _draw_track_box(self, ox, oy, dw, dh, fw, fh) -> None:
         """Overlay the live (morphing) box the firmware is tracking, in green.
 
@@ -845,8 +1194,7 @@ class App:
         self.canvas.delete("trackbox")
         if self.ctl is None or fw == 0:
             return
-        box = self.ctl.state.get("track_box")
-        ts = self.ctl.state.get("track_box_ts", 0.0)
+        box, ts = self._live_track_box()
         if (not box or box[0] <= TRACK_NO_TARGET or box[1] <= TRACK_NO_TARGET
                 or (time.time() - ts) > BOX_STALE_S):
             return
@@ -1004,8 +1352,7 @@ class App:
         # should correct the ACTUAL current lock, not the stale mouse-drawn
         # rectangle from whenever the box was first drawn.
         if self.ctl is not None:
-            box = self.ctl.state.get("track_box")
-            ts = self.ctl.state.get("track_box_ts", 0.0)
+            box, ts = self._live_track_box()
             if (box and box[0] > TRACK_NO_TARGET and box[1] > TRACK_NO_TARGET
                     and (time.time() - ts) <= BOX_STALE_S):
                 self.roi = box
@@ -1044,16 +1391,19 @@ class App:
             self._status("Select a ROI first (drag on the video).")
             return
         # self.roi is already in stream-pixel space (the decoded RTSP frame IS the
-        # wide stream, ~1920x1080). start_track_roi() appends the CAPTURE-VERIFIED
-        # 5th field (=1) the app sends; together with the V3 camera bring-up done
-        # on connect, this is the recipe that actually locks.
+        # wide stream, ~1920x1080). start_track_roi()'s 5th field is TrackProto.
+        # ReqStartTrack.camId (0=Tele, 1=Wide, 15=General — confirmed from the
+        # DwarfLab APK's decompiled protobuf source). It must match whichever
+        # camera is actually selected, not be hardcoded to Wide.
         x, y, w, h = self.roi
-        ok = self.ctl.start_track_roi(x, y, w, h)   # 5th field added in controller
+        is_wide = CAMERAS.get(self.cam_var.get()) == "ch1"
+        ok = self.ctl.start_track_roi(x, y, w, h, field5=(1 if is_wide else 0))
         self._tracking = ok
         if ok:
             self._hide_roi_rect()   # clear the blue dashed box so the response box shows
         self._status(
-            f"Track ROI sent ({x},{y},{w},{h}) +f5=1. Blue cleared; watch for green."
+            f"Track ROI sent ({x},{y},{w},{h}) camId={1 if is_wide else 0}. "
+            "Blue cleared; watch for green."
             if ok else "Send failed — not connected.")
 
     def _start_ai_track(self) -> None:
@@ -1408,8 +1758,7 @@ class App:
             self._status(f"Keyboard jog: joy({jx:+.0f},{jy:+.0f})")
 
     def _drive_to_center(self) -> None:
-        box = self.ctl.state.get("track_box")
-        ts = self.ctl.state.get("track_box_ts", 0.0)
+        box, ts = self._live_track_box()
         fw, fh = self._frame_wh
         stale = (time.time() - ts) > BOX_STALE_S
         lost = (not box or fw == 0 or box[0] <= TRACK_NO_TARGET
@@ -1764,6 +2113,18 @@ class App:
             f"Live match: on ({os.path.basename(ref_path)}) — searching…")
         self._ensure_match_window()
 
+    # ── live stacking (tele only) ────────────────────────────────────────────
+    def _open_live_stack(self) -> None:
+        if self.stack_win is not None and self.stack_win.win.winfo_exists():
+            self.stack_win.win.lift()
+            self.stack_win.win.focus_force()
+            return
+        if self.ctl is None:
+            self._status("Live Stack opened — connect first so the tele "
+                        "camera is actually streaming.")
+        self.stack_win = LiveStackWindow(self.root, self.ip,
+                                         photo_dir=self.photo_dir)
+
     def _get_tele_frame(self) -> tuple[np.ndarray | None, bool]:
         """Always returns the TELE stream's frame, regardless of which camera
         is currently selected as primary — live match targets tele always.
@@ -1980,6 +2341,8 @@ class App:
     def _on_close(self) -> None:
         if self.wit is not None:
             self.wit.stop()
+        if self.stack_win is not None and self.stack_win.win.winfo_exists():
+            self.stack_win._on_close()
         self._disconnect()
         self.root.destroy()
 

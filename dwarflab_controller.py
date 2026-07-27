@@ -136,9 +136,31 @@ CMD_RGB_POWER_POWERIND_OFF               = 13504
 CMD_RGB_POWER_REBOOT                     = 13505
 
 # ── Motor commands (14000-14499) ──────────────────────────────────────────────
+# GHIDRA-derived (magni FUN_00448fb0 registration table, 2026-07-26 pass) full
+# cmd->handler map for 14000-14013. Every per-axis command below selects one
+# of 4 motor-axis objects via a protobuf field (0-3) before acting - DWARF3
+# has (at least) 4 independently addressable motor axes at the firmware
+# level, not just RA/DEC. Names/semantics below not confirmed live except
+# where an explicit zlog name was found in the decompile (marked CONFIRMED);
+# the rest are inferred purely from callee behavior (marked INFERRED) - treat
+# with appropriate skepticism until tested against a live axis-index sweep.
+CMD_STEP_MOTOR_MOVE_TO_ANGLE             = 14000  # INFERRED: axis-select + absolute move (FUN_007457c0)
+CMD_STEP_MOTOR_RUN_TO                    = 14001  # CONFIRMED zlog name "runTo"
+CMD_STEP_MOTOR_STOP_AXIS                 = 14002  # INFERRED: axis-select, parameterless halt vtable call
+CMD_STEP_MOTOR_RESET                     = 14003  # CONFIRMED zlog name "reset"
+CMD_STEP_MOTOR_CANCEL_MOVE               = 14004  # INFERRED: axis-select + FUN_00743960 (abort)
+CMD_STEP_MOTOR_STOP_MOVE                 = 14005  # INFERRED: axis-select + FUN_00742798 (softer stop)
 CMD_STEP_MOTOR_JOYSTICK                  = 14006  # CMD_STEP_MOTOR_SERVICE_JOYSTICK
 CMD_STEP_MOTOR_JOYSTICK_FIXED_ANGLE      = 14007  # CMD_STEP_MOTOR_SERVICE_JOYSTICK_FIXED_ANGLE
 CMD_STEP_MOTOR_JOYSTICK_STOP             = 14008  # CMD_STEP_MOTOR_SERVICE_JOYSTICK_STOP
+CMD_STEP_MOTOR_DUAL_CAMERA_LINKAGE       = 14009  # CONFIRMED zlog name "startDualCameraLinkage" (syncs tele+wide motor movement)
+CMD_STEP_MOTOR_RUN_TO_RAMPED             = 14010  # INFERRED: axis-select + speed-ramped move (2 variants by flag)
+# GHIDRA-derived (magni FUN_00448fb0 handler table, not in the app's WsCmd
+# list at all): empty-payload requests that start/stop a continuous
+# CMD_NOTIFY_DEVICE_ATTITUDE (15295) stream from the mount's built-in gyro.
+CMD_MOT_START_DEVICE_ATTITUDE_NOTIFY     = 14012
+CMD_MOT_STOP_DEVICE_ATTITUDE_NOTIFY      = 14013
+CMD_STEP_MOTOR_GET_POSITION              = 14011  # CONFIRMED zlog name "getPosition"
 
 # ── Track commands (14800-14899) ──────────────────────────────────────────────
 CMD_TRACK_START_TRACK                    = 14800
@@ -208,6 +230,13 @@ CMD_NOTIFY_WIDE_TRACK_STATE              = 15284  # CAPTURE-VERIFIED (June 2026)
         # NOT present in the decompiled WsCmd table — found by decoding a live
         # iOS-app capture (see dwarf_capture_decode.py / TRACKING_FINDINGS.md).
 CMD_NOTIFY_TEMPERATURE                   = 15243
+# GHIDRA-derived: DeviceAttitude{pitch=1, yaw=2, roll=3} (all double), sent by
+# a dedicated background thread in magni while CMD_MOT_START_DEVICE_ATTITUDE_
+# NOTIFY (14012) is active. The firmware's own sender only ever populates 2 of
+# the 3 fields in the decompiled path we traced (a heading-like angle minus a
+# fixed 157.75 deg offset, plus a second angle) — treat the third as unverified
+# until confirmed live.
+CMD_NOTIFY_DEVICE_ATTITUDE               = 15295
 
 # ── Tracking coordinate reference (CAPTURE-VERIFIED) ───────────────────────────
 # Track-result boxes are TOP-LEFT (x, y) + (w, h) in a FIXED reference frame,
@@ -300,6 +329,31 @@ def _parse_varint_fields(data):
         pass
     return out
 
+def _parse_double_fields(data):
+    """Walk a protobuf message and return {field_number: float} for all
+    fixed64 (wire type 1, e.g. `double`) fields. Used to decode
+    DeviceAttitude {pitch=1, yaw=2, roll=3}, all `double`."""
+    out = {}
+    i, n = 0, len(data)
+    try:
+        while i < n:
+            tag, i = _dvarint(data, i)
+            fn, wt = tag >> 3, tag & 7
+            if wt == 1:
+                out[fn] = struct.unpack("<d", data[i:i + 8])[0]
+                i += 8
+            elif wt == 0:
+                _, i = _dvarint(data, i)
+            elif wt == 2:
+                ln, i = _dvarint(data, i); i += ln
+            elif wt == 5:
+                i += 4
+            else:
+                break
+    except IndexError:
+        pass
+    return out
+
 def _parse_multi_track(data):
     """Best-effort decode of CMD_NOTIFY_MULTI_TRACK_RESULT (15238) /
     CMD_NOTIFY_WIDE_MULTI_TRACK_RESULT (15251). The exact layout is undocumented
@@ -329,6 +383,150 @@ def _parse_multi_track(data):
     except IndexError:
         pass
     return out
+
+# ── WsRespCode table (from com/convergence/dwarflab/data/bean/ws/WsRespCode.java,
+# the APK's complete enum, 129 entries) ────────────────────────────────────────
+# Arrives in the packet's `type` field (f6) on a response/ack. 0 = WS_OK, any
+# negative value is a specific failure. Each module's error range mirrors its
+# cmd-id range with a fixed offset, e.g. CAMERA_TELE cmds 10000-10047 <->
+# errors -10500..-10518, ASTRO cmds 11000s <-> -11500s, etc.
+WSRESPCODE = {
+    0: "WS_OK",
+    -1: "WS_PARSE_PROTOBUF_ERROR",
+    -2: "WS_SDCARD_NOT_EXIST",
+    -3: "WS_INVAID_PARAM",
+    -4: "WS_SDCARD_WRITE_ERROR",
+    -5: "WS_DEVICE_NOT_ACTIVATED",
+    -6: "WS_SDCARD_FULL_ERROR",
+    -10500: "CODE_CAMERA_TELE_OPENED",
+    -10501: "CODE_CAMERA_TELE_CLOSED",
+    -10502: "CODE_CAMERA_TELE_ISP_SET_FAILED",
+    -10503: "CODE_CAMERA_TELE_OPEN_FAILED",
+    -10504: "CODE_CAMERA_TELE_START_RECORD_FAILED",
+    -10505: "CODE_CAMERA_TELE_STOP_RECORD_FAILED",
+    -10506: "CODE_CAMERA_TELE_CAPTURE_RAW_FAILED",
+    -10507: "CODE_CAMERA_TELE_WORKING_BUSY",
+    -10508: "CODE_CAMERA_TELE_GET_IMAGE_FAILED",
+    -10509: "CODE_CAMERA_TELE_RUNNING_PHOTO",
+    -10510: "CODE_CAMERA_TELE_RUNNING_RECORD",
+    -10511: "CODE_CAMERA_TELE_RUNNING_PANORAMA",
+    -10512: "CODE_CAMERA_TELE_RUNNING_TIMELAPSE",
+    -10513: "CODE_CAMERA_TELE_RUNNING_CAPTURE_DARK",
+    -10514: "CODE_CAMERA_TELE_RUNNING_CAPTURE_LIVE_STACKING",
+    -10515: "CODE_CAMERA_TELE_EXP_TOO_LONG",
+    -10516: "CODE_CAMERA_TELE_SWITCH_WORK_MODE_FAILED",
+    -10517: "CODE_CAMERA_TELE_RUNNING_TRACK",
+    -10518: "CODE_CAMERA_TELE_RECORD_FILE_ERROR",
+    -11500: "CODE_ASTRO_PLATE_SOLVING_FAILED",
+    -11501: "CODE_ASTRO_FUNCTION_BUSY",
+    -11502: "CODE_ASTRO_DARK_GAIN_OUT_OF_RANGE",
+    -11503: "CODE_ASTRO_DARK_NOT_FOUND",
+    -11504: "CODE_ASTRO_CALIBRATION_FAILED",
+    -11505: "CODE_ASTRO_GOTO_FAILED",
+    -11506: "CODE_ASTRO_DARK_RUNNING",
+    -11507: "CODE_ASTRO_CALIBRATION_RUNNING",
+    -11508: "CODE_ASTRO_GOTO_RUNNING",
+    -11509: "CODE_ASTRO_LIVE_STACKING_RUNNING",
+    -11510: "CODE_ASTRO_RESET_PITCH_MOTOR_FAILED",
+    -11511: "CODE_ASTRO_NEED_CALIBRATION",
+    -11512: "CODE_ASTRO_GOTO_READ_MOTOR_POSITION_AND_PLATE_SOLVING_FAILED",
+    -11513: "CODE_ASTRO_NEED_GOTO",
+    -11514: "CODE_ASTRO_NEED_ADJUST_SHOOT_PARAM",
+    -11515: "CODE_ASTRO_CALIBRATION_PLATE_SOLVING_FAILED_TOO_MUCH",
+    -11516: "CODE_ASTRO_EQ_SOLVING_FAILED",
+    -11517: "CODE_ASTRO_SKY_SEARCH_FAILED",
+    -11518: "CODE_ASTRO_NEED_GOTO_DSO",
+    -11519: "CODE_ASTRO_RESTACK_CAMERA_MISMATCH",
+    -11520: "CODE_ASTRO_RESTACK_BINNING_MISMATCH",
+    -11521: "CODE_ASTRO_RESTACK_FILTER_MISMATCH",
+    -11522: "CODE_ASTRO_RESTACK_TARGET_MISMATCH",
+    -11523: "CODE_ASTRO_RESTACK_DARKFRAME_MISMATCH",
+    -11524: "CODE_ASTRO_RESTACK_FAILED",
+    -11525: "CODE_ASTRO_RESTACK_INVALID_DATA",
+    -11526: "CODE_ASTRO_OVEREXPOSURE_WARNING",
+    -11527: "CODE_ASTRO_EXP_TOO_LONG",
+    -11528: "CODE_ASTRO_NEED_EQ",
+    -11529: "CODE_ASTRO_STAR_TOO_FEW",
+    -11530: "CODE_ASTRO_DARK_TEMP_MISMATCH",
+    -11531: "CODE_ASTRO_SUN_MOON_NOT_FOUND",
+    -12500: "CODE_CAMERA_WIDE_OPENED",
+    -12501: "CODE_CAMERA_WIDE_CLOSED",
+    -12502: "CODE_CAMERA_WIDE_CANNOT_FOUND",
+    -12503: "CODE_CAMERA_WIDE_OPEN_FAILED",
+    -12504: "CODE_CAMERA_WIDE_CLOSE_FAILED",
+    -12505: "CODE_CAMERA_WIDE_SET_ISP_FAILED",
+    -12506: "CODE_CAMERA_WIDE_PHOTOGRAPHING",
+    -12507: "CODE_CAMERA_WIDE_TIMELAPSE_RECORDING",
+    -12508: "CODE_CAMERA_WIDE_EXP_TOO_LONG",
+    -12509: "CODE_CAMERA_WIDE_RECORD_FILE_ERROR",
+    -13300: "CODE_SYSTEM_SET_TIME_FAILED",
+    -13301: "CODE_SYSTEM_SET_TIMEZONE_FAILED",
+    -13800: "CODE_RGB_POWER_UART_INIT_FAILED",
+    -13801: "CODE_RGB_POWER_UART_SEND_FAILED",
+    -14500: "CODE_STEP_MOTOR_IS_RUNNING",
+    -14501: "CODE_STEP_MOTOR_IS_STOPPED",
+    -14502: "CODE_STEP_MOTOR_PARALLEL_IN",
+    -14503: "CODE_STEP_MOTOR_PARALLEL_END",
+    -14504: "CODE_STEP_MOTOR_INVALID_PARAMETER_ID",
+    -14505: "CODE_STEP_MOTOR_INVALID_PARAMETER_ANGLE",
+    -14506: "CODE_STEP_MOTOR_INVALID_PARAMETER_SPEED",
+    -14507: "CODE_STEP_MOTOR_INVALID_PARAMETER_SPEED_RAMPING",
+    -14508: "CODE_STEP_MOTOR_INVALID_PARAMETER_RESOLUTION",
+    -14509: "CODE_STEP_MOTOR_INVALID_PARAMETER_POSITION",
+    -14510: "CODE_STEP_MOTOR_OVERTIME_GET_LIMIT_RETURN",
+    -14511: "CODE_STEP_MOTOR_OVERTIME_GET_RESET_RETURN",
+    -14512: "CODE_STEP_MOTOR_OVERTIME_GET_ABSOLUTE_POSITION_RETURN",
+    -14513: "CODE_STEP_MOTOR_OVERTIME_GET_RELATIVE_POSITION_RETURN",
+    -14514: "CODE_STEP_MOTOR_OVERTIME_WAIT_TO_STOP",
+    -14515: "CODE_STEP_MOTOR_OVERTIME_WAIT_TO_RUN",
+    -14516: "CODE_STEP_MOTOR_LIMIT_SPEED_TO_MAX",
+    -14517: "CODE_STEP_MOTOR_LIMIT_SPEED_TO_MIN",
+    -14518: "CODE_STEP_MOTOR_LIMIT_POSITION_WARNING",
+    -14519: "CODE_STEP_MOTOR_LIMIT_POSITION_HIT",
+    -14520: "CODE_STEP_MOTOR_NEED_RESET",
+    -14521: "CODE_STEP_MOTOR_OVERTIME_GET_PE_SWITCH_RETURN",
+    -14522: "CODE_STEP_MOTOR_OVERTIME_TO_RESET",
+    -14900: "CODE_TRACK_TRACKER_INITING",
+    -14901: "CODE_TRACK_TRACKER_FAILED",
+    -14902: "CODE_TRACK_SENTRY_MODE_INITING",
+    -14903: "CODE_TRACK_SENTRY_MODE_FAILED",
+    -14904: "CODE_UFOTRACK_MODE_INITING",
+    -14905: "CODE_UFOTRACK_MODE_FAILED",
+    -14906: "CODE_UFO_DAY_AUTO_MODE",
+    -15100: "CODE_FOCUS_ASTRO_AUTO_FOCUS_SLOW_ERROR",
+    -15101: "CODE_FOCUS_ASTRO_AUTO_FOCUS_FAST_ERROR",
+    -15106: "CODE_FOCUS_EXP_TOO_LONG",
+    -15107: "CODE_FOCUS_INFINITY_POS_ERROR",
+    -15108: "CODE_FOCUS_GET_NOW_POS_FAILED",
+    -15600: "CODE_PANORAMA_PHOTO_FAILED",
+    -15601: "CODE_PANORAMA_MOTOR_RESET_FAILED",
+    -15602: "CODE_PANORAMA_UPLOAD_USER_STOP",
+    -15603: "CODE_PANORAMA_UPLOAD_FILE_CHECK_FAILED",
+    -15604: "CODE_PANORAMA_UPLOAD_COMPRESS_FAILED",
+    -15605: "CODE_PANORAMA_UPLOAD_UPLOAD_FAILED",
+    -15606: "CODE_PANORAMA_UPLOAD_NOT_EXIST",
+    -15607: "CODE_PANORAMA_UPLOAD_IS_RUNNING",
+    -15608: "CODE_PANORAMA_UPLOAD_CAMERA_BUSY",
+    -15609: "CODE_PANORAMA_UPLOAD_NOT_IN_STA",
+    -15612: "CODE_PANORAMA_COMPRESSION_IS_RUNNING",
+    -15614: "CODE_PANORAMA_COMPOSE_IS_IDEL",
+    -15615: "CODE_PANORAMA_COMPOSE_IS_RUNNING",
+    -16300: "CODE_SHOOTING_SCHEDULE_DEVICE_ID_NOT_MATCH",
+    -16301: "CODE_SHOOTING_SCHEDULE_INVALID_SHOOTING_DURATION",
+    -16302: "CODE_SHOOTING_SCHEDULE_TIME_CONFLICT",
+    -16303: "CODE_SHOOTING_SCHEDULE_INVALID_TASK_DURATION",
+    -16305: "CODE_SHOOTING_SCHEDULE_DATABASE_OPERATION_FAILED",
+    -16306: "CODE_SHOOTING_SCHEDULE_PASSWORD_ERROR",
+    -16307: "CODE_SHOOTING_SCHEDULE_SHOOTING",
+    -16308: "CODE_SHOOTING_SCHEDULE_START_TIME_TOO_FAR",
+    -16600: "CODE_GLOBAL_TASK_MANAGER_BUSY",
+}
+
+def describe_resp_code(code):
+    """Human-readable name for a WsRespCode `type` value, e.g. -11528 ->
+    'CODE_ASTRO_NEED_EQ'. Falls back to 'UNKNOWN(code)' for anything not in
+    the APK's enum (e.g. a future firmware version added a new code)."""
+    return WSRESPCODE.get(code, f"UNKNOWN({code})")
 
 # ── Packet builder / parser ───────────────────────────────────────────────────
 def build_ws_packet(cmd, data=b"", device_id=1, client_id=""):
@@ -498,6 +696,14 @@ class DwarfLab:
         cmd  = pkt["cmd"]
         data = pkt["data"]
 
+        # WsRespCode: a negative `type` on any packet is a specific named
+        # failure (see WSRESPCODE / describe_resp_code()), not just "-3".
+        if pkt["type"] < 0:
+            name = describe_resp_code(pkt["type"])
+            self.state["last_error"] = {"cmd": cmd, "code": pkt["type"],
+                                         "name": name, "ts": time.time()}
+            log.warning(f"WS error resp: cmd={cmd} code={pkt['type']} ({name})")
+
         # Battery
         if cmd == CMD_NOTIFY_ELE:
             try: v, _ = _dvarint(data, 1); self.state["battery"] = v
@@ -558,6 +764,16 @@ class DwarfLab:
                 self.state["track_box_ts"] = time.time()
                 self.state["track_box_src"] = (
                     "wide" if cmd == CMD_NOTIFY_WIDE_TRACK_RESULT else "tele")
+                print(f"[TRACKBOX] cmd={cmd} src={self.state['track_box_src']} "
+                      f"box={box} raw_fields={f}", flush=True)
+            except: pass
+
+        # Built-in mount gyro attitude (GHIDRA-derived; see start_attitude_notify())
+        elif cmd == CMD_NOTIFY_DEVICE_ATTITUDE:
+            try:
+                f = _parse_double_fields(data)
+                self.state["device_attitude"] = (f.get(1), f.get(2), f.get(3))
+                self.state["device_attitude_ts"] = time.time()
             except: pass
 
         # Wide track state (CAPTURE-VERIFIED; absent from the APK table)
@@ -723,6 +939,18 @@ class DwarfLab:
     def start_tracking(self):        self.send(CMD_TRACK_START_TRACK)
     def stop_tracking(self):         self.send(CMD_TRACK_STOP_TRACK)
 
+    # ── Built-in mount gyro (GHIDRA-derived; not in the app's own WsCmd list) ──
+    def start_attitude_notify(self):
+        """CMD_MOT_START_DEVICE_ATTITUDE_NOTIFY (14012), empty payload. Spawns a
+        background thread in the firmware (traced via Ghidra: magni@0x7367c0)
+        that streams CMD_NOTIFY_DEVICE_ATTITUDE (15295) {pitch,yaw,roll} from
+        the mount's built-in gyro until stop_attitude_notify() is called."""
+        return self.send(CMD_MOT_START_DEVICE_ATTITUDE_NOTIFY)
+
+    def stop_attitude_notify(self):
+        """CMD_MOT_STOP_DEVICE_ATTITUDE_NOTIFY (14013), empty payload."""
+        return self.send(CMD_MOT_STOP_DEVICE_ATTITUDE_NOTIFY)
+
     # ── V3 camera + MOT (Multi-Object Tracking) pipeline ───────────────────────
     # The DWARF 3 (V3 firmware) AI subject tracking runs through the 30-class
     # object detector + MOT, NOT the basic 14800 correlation tracker. Typical
@@ -758,17 +986,21 @@ class DwarfLab:
         """CMD_MOT_TRACK_ONE (14805) — lock a detected tele object by id."""
         return self.send(CMD_MOT_TRACK_ONE, _field(1, 0, int(obj_id)))
 
-    def start_track_roi(self, x, y, w, h, field5=1):
+    def start_track_roi(self, x, y, w, h, field5):
         """
         CMD_TRACK_START_TRACK (14800) with a manual ROI.
-        ReqStartTrack { int32 x=1; int32 y=2; int32 w=3; int32 h=4; int32 f5=5 }
+        ReqStartTrack { int32 x=1; int32 y=2; int32 w=3; int32 h=4; int32 camId=5 }
         Coordinates are in *wide-stream pixel* space (≈1920x1080, NOT 1280x720).
 
-        CAPTURE-VERIFIED: the iOS app sends a FIFTH field (=1) that the public
-        proto omits, AND only locks reliably after the V3 camera bring-up
-        (v3_mode_switch + v3_open_tele/wide). Sending the 4-field form alone runs
-        the basic correlation tracker, which usually fails to lock (returns -100).
-        A real app lock observed here was 2592/2592 valid boxes with f5=1.
+        field5 IS TrackProto.ReqStartTrack.camId (0=Tele, 1=Wide, 15=General —
+        confirmed from the DwarfLab APK's decompiled protobuf source, see
+        CameraType.java / TrackProto.java). It is proto3, so camId=0 (Tele) is
+        never written to the wire — only Wide's camId=1 ever appears as a real
+        byte. There is no default: every caller must pass the camId matching
+        the camera actually being tracked, or the firmware calibrates the lock
+        against the wrong camera's FOV (this was the root cause of the
+        long-standing tele slew overshoot — every track command was silently
+        hardcoded to camId=1/Wide regardless of which camera was selected).
         """
         x, y, w, h = int(x), int(y), int(w), int(h)
         data = (_field(1, 0, x) + _field(2, 0, y) +

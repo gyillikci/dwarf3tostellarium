@@ -92,6 +92,15 @@ So the commands the app sent at "create tracking" were **V3 camera bring-up +
 astro param/preset reads** — the box stream was already running, which is why they
 *looked* like a start. The mislabelled constant/method were removed.
 
+**Further correction (2026-07-26, Ghidra ground truth):** disassembling `bin/magni`
+(firmware v1.5.0.1) and recovering the Astro module's actual command dispatch table
+directly from the binary shows `11043 = CMD_ASTRO_GET_CALI_FRAME_LIST`, not
+`V3_ASTRO_GET_PRESETS`. The firmware's own dispatch table is ground truth for this
+exact build; the `dwarfAlp` reference repo above may reflect a different firmware
+version's numbering, or simply be wrong. Prefer the firmware-derived table
+(`dwarf3/firmware/registrar_tables_parsed.txt` in the workspace) over `dwarfAlp` for
+any cmd ID in the 11000-11048 or 14000-14013 ranges going forward.
+
 ### 6. Why tracking fails on the Windows host (root cause)
 DWARF 3 runs **V3 firmware** and has **two different trackers**; our tools used
 the wrong one without the V3 setup:
