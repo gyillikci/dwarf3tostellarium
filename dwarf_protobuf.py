@@ -144,7 +144,59 @@ NESTED_SCHEMAS: dict[str, list[Field]] = {
                       (3, "coord2", "double"), (4, "name", "str")],
     # nested inside NOTIFY_ASTRO_TARGET_STATUS (15233) — see SCHEMAS[15233].
     "target_status": [(1, "state", "int"), (2, "name", "str")],
+
+    # ── added 2026-07-31: PANORAMA/SHOOTING_SCHEDULE/TASK_CENTER/VOICE_ASSISTANT
+    # nested messages, from proto_reconstructed/*.proto (recovered from magni's own
+    # embedded FileDescriptorProto blobs — see dwarf3-tracking-protocol memory,
+    # "Full formal protobuf schema recovered directly from bin/magni"). Field layout
+    # is schema-exact (parsed from the real descriptor), not guessed; only the CMD-ID
+    # <-> message assignment for a few gaps is inferred (flagged per-field in SCHEMAS
+    # below, not here).
+    "shooting_task_msg": [
+        (1, "schedule_id", "str"), (2, "params", "str"), (3, "state", "int"),
+        (4, "code", "int"), (5, "created_time", "int"), (6, "updated_time", "int"),
+        (7, "schedule_task_id", "str"), (8, "param_mode", "int"),
+        (9, "param_version", "int"), (10, "create_from", "int"),
+    ],
+    "shooting_schedule_msg": [
+        (1, "schedule_id", "str"), (2, "schedule_name", "str"), (3, "device_id", "int"),
+        (4, "mac_address", "str"), (5, "start_time", "int"), (6, "end_time", "int"),
+        (7, "result", "int"), (8, "created_time", "int"), (9, "updated_time", "int"),
+        (10, "state", "int"), (11, "lock", "int"), (12, "password", "str"),
+        (13, "shooting_tasks", ("repeated", ("msg", "shooting_task_msg"))),
+        (14, "param_mode", "int"), (15, "param_version", "int"), (16, "params", "str"),
+        (17, "schedule_time", "int"), (18, "sync_state", "int"),
+    ],
+    # ReqEnterCamera{client_param=3}/ClientParams{encode_type=1} — the real proto
+    # shape behind what dwarflab_controller.py's v3_mode_switch() sends as {3:{1:m}}.
+    "client_params": [(1, "encode_type", "int")],
+    "voice_move_params": [(1, "azimuth_angle", "double"), (2, "altitude_angle", "double"),
+                          (3, "speed", "int")],
+    "voice_focus_params": [(1, "is_infinity", "bool")],
+    "voice_sentry_params": [(1, "type", "int")],
+    "voice_calibration_params": [(1, "lon", "double"), (2, "lat", "double")],
+    "voice_panorama_params": [(1, "rows", "int"), (2, "columns", "int")],
+    "deep_sky_target": [(1, "ra", "double"), (2, "dec", "double"),
+                        (3, "target_name", "str"), (4, "lon", "double"),
+                        (5, "lat", "double"), (6, "ir_index", "int")],
+    "solar_system_target": [(1, "index", "int"), (2, "lon", "double"),
+                            (3, "lat", "double"), (4, "target_name", "str")],
+    "voice_goto_params": [(1, "deep_sky", ("msg", "deep_sky_target")),
+                          (2, "solar_system", ("msg", "solar_system_target")),
+                          (7, "shooting_mode", "int")],
+    "voice_track_params": [(1, "deep_sky", ("msg", "deep_sky_target")),
+                           (2, "solar_system", ("msg", "solar_system_target"))],
 }
+
+_VOICE_CMD_TYPE = ("enum", {
+    0: "UNKNOWN", 1: "GET_STATUS", 2: "TAKE_PHOTO", 3: "START_RECORD", 4: "STOP_RECORD",
+    5: "START_TIMELAPSE", 6: "STOP_TIMELAPSE", 7: "START_BURST", 8: "STOP_BURST",
+    9: "START_ASTRO", 10: "STOP_ASTRO", 11: "START_SENTRY", 12: "STOP_SENTRY",
+    13: "MOVE", 14: "GOTO_TARGET", 15: "STOP_GOTO", 16: "CALIBRATION",
+    17: "STOP_CALIBRATION", 18: "AUTO_FOCUS", 19: "STOP_FOCUS", 20: "STOP_ALL",
+    21: "START_TRACK", 22: "STOP_TRACK", 23: "ADD_SCHEDULE", 24: "CANCEL_SCHEDULE",
+    25: "END_CONVERSATION", 26: "START_PANORAMA", 27: "STOP_PANORAMA",
+})
 
 # cmd id -> payload schema.  Requests (phone -> device) and notifies (device ->
 # phone) alike, keyed by the WsCmd `cmd` field. Everything here is grounded in the
@@ -197,6 +249,102 @@ SCHEMAS: dict[int, list[Field]] = {
     15002: [],                                              # FOCUS_START_MANUAL_CONTINUOUS
     15003: [],                                              # FOCUS_STOP_MANUAL_CONTINUOUS
     15004: [],                                              # FOCUS_START_ASTRO_AUTO_FOCUS
+
+    # ── PANORAMA (module 10, 15500-15599) — added 2026-07-31. IDs zlog/ack-call
+    # CONFIRMED per firmware/ack_calls_parsed.txt except where marked UNCONFIRMED
+    # (those cmd ids are gaps in the 295-site bare-ack scan — likely because they're
+    # data-returning GET-style handlers that use the OTHER universal sender
+    # (FUN_00793398), not the plain-ack one the scan searched; the field layout
+    # itself is still schema-exact from the recovered panorama.proto, only the
+    # cmd-id<->message ASSIGNMENT for these three is inferred by proto declaration
+    # order, matching the pattern already proven correct for the confirmed ones).
+    15500: [],                                              # ReqStartPanoramaByGrid (CONFIRMED)
+    15501: [],                                              # ReqStopPanorama (CONFIRMED)
+    15502: [(1, "yaw_range", "float"), (2, "pitch_range", "float")],  # UNCONFIRMED id
+    15503: [(1, "resource_id", "u64"), (2, "user_id", "str"), (3, "app_platform", "int"),
+            (4, "panorama_name", "str"), (5, "ak", "str"), (6, "sk", "str"),
+            (7, "token", "str"), (8, "bucket", "str"), (9, "bucket_prefix", "str"),
+            (10, "from", "str"), (11, "env_type", "str")],  # ReqStartPanoramaStitchUpload (CONFIRMED)
+    15504: [(1, "user_id", "str")],                         # ReqStopPanoramaStitchUpload (CONFIRMED)
+    15505: [],                                              # ReqGetPanoramaCurrentUploadState, UNCONFIRMED id
+    15506: [(1, "panorama_name", "str")],                   # ReqGetUploadPredict, UNCONFIRMED id
+    15507: [(1, "panorama_name", "str")],                   # ReqCompressPanorama (CONFIRMED)
+    15508: [],                                              # ReqStopCompressPanorama (CONFIRMED)
+    15509: [],                                              # ReqStartPanoramaFraming (CONFIRMED)
+    15510: [],                                              # ReqStopPanoramaFraming (CONFIRMED)
+    15511: [],                                              # ReqResetPanoramaFraming (CONFIRMED)
+    15512: [(1, "norm_x_tl", "double"), (2, "norm_y_tl", "double"),
+            (3, "norm_x_br", "double"), (4, "norm_y_br", "double")],  # ReqUpdatePanoramaFramingRect (CONFIRMED)
+    15513: [],                                              # ReqStopPanoramaFramingAndStartGrid (CONFIRMED)
+    15514: [],                                              # ReqNotifyPanoramaFraming (CONFIRMED, device->phone)
+
+    # ── SHOOTING_SCHEDULE (module 13, 16100-16108) — added 2026-07-31. Field layout
+    # schema-exact; three cmd ids (16102/16103/16106/16107) UNCONFIRMED by zlog (same
+    # "GET/data-returning handler not in the bare-ack scan" reasoning as panorama
+    # above), assigned by proto declaration order (9 Req* messages, sequential
+    # 16100-16108 — the same pattern independently confirmed for 16100/16101/16104/
+    # 16105/16108, so high confidence, just not individually zlog-verified).
+    16100: [(1, "shooting_schedule", ("msg", "shooting_schedule_msg"))],  # ReqSyncShootingSchedule (CONFIRMED)
+    16101: [(1, "id", "str"), (2, "password", "str")],      # ReqCancelShootingSchedule (CONFIRMED)
+    16102: [],                                              # ReqGetAllShootingSchedule, UNCONFIRMED id
+    16103: [(1, "id", "str")],                              # ReqGetShootingScheduleById, UNCONFIRMED id
+    16104: [(1, "id", "str")],                              # ReqGetShootingTaskById (CONFIRMED, zlog "getShootingTaskId")
+    16105: [(1, "shooting_schedule", ("msg", "shooting_schedule_msg"))],  # ReqReplaceShootingSchedule (CONFIRMED)
+    16106: [(1, "id", "str"), (2, "password", "str")],      # ReqUnlockShootingSchedule, UNCONFIRMED id
+    16107: [(1, "id", "str"), (2, "password", "str")],      # ReqLockShootingSchedule, UNCONFIRMED id
+    16108: [(1, "id", "str"), (2, "password", "str")],      # ReqDeleteShootingSchedule (CONFIRMED)
+
+    # ── PARAM (module 15, 16700-16706) — added 2026-07-31. ALL 7 cmd ids CONFIRMED
+    # by zlog debug strings (firmware/ack_calls_parsed.txt: CMD_PARAM_SET_EXPOSURE
+    # .. CMD_PARAM_SET_AUTO_PARAMS); param_id is the 64-bit id whose bit 44 encodes
+    # camera (0=tele/1=wide) — see dwarf3-tracking-protocol memory "parameter
+    # commands DO bake camera identity into a 64-bit paramId".
+    16700: [(1, "param_id", "u64"), (2, "mode", "int"), (3, "value", "int")],   # ReqSetExposure
+    16701: [(1, "param_id", "u64"), (2, "mode", "int"), (3, "value", "int")],   # ReqSetGain
+    16702: [(1, "param_id", "u64"), (2, "mode", "int"), (3, "value", "int")],   # ReqSetWb
+    16703: [(1, "param_id", "u64"), (2, "value", "int")],                      # ReqSetGeneralIntParam
+    16704: [(1, "param_id", "u64"), (2, "value", "float")],                    # ReqSetGeneralFloatParam
+    16705: [(1, "param_id", "u64"), (2, "value", "bool")],                     # ReqSetGeneralBoolParams
+    16706: [(1, "camera_type", "int"), (2, "shooting_tech", "int"),
+            (3, "is_auto", "bool")],                                          # ReqSetAutoParam
+
+    # ── DEVICE (module 17, 17000-17002) — added 2026-07-31. ALL 3 CONFIRMED by zlog
+    # (CMD_DEVICE_LENS_DEFOG/AUTO_COOLING/AUTO_SHUTDOWN).
+    17000: [(1, "state", "int")],                           # ReqLensDefog
+    17001: [(1, "state", "int")],                            # ReqAutoCooling
+    17002: [(1, "state", "int")],                            # ReqAutoShutdown
+
+    # ── TASK_CENTER (module 14, 16400-16405) — added 2026-07-31. 16403-16405
+    # CONFIRMED (16403 by existing capture-verified CMD_V3_DEVICE_CONFIG_SHOOTING_MODE
+    # naming, 16404 by both capture verification AND proto field match — see
+    # dwarflab_controller.py v3_mode_switch()/enter_camera(), 16405 by zlog). The
+    # remaining trio (16400/16401/16402 = ReqStartTask/ReqStopTask/
+    # ReqSwitchShootingTech in some order) is a GENUINE OPEN GAP: this module's own
+    # proto declaration order does NOT match its confirmed IDs (ReqEnterCamera is
+    # declared 3rd but confirmed at 16404, the 5th slot), so simple sequential
+    # assignment — which worked for panorama/shooting_schedule above — is proven
+    # UNRELIABLE for this specific module. Deliberately NOT schema'd/guessed here;
+    # they'll fall through to the generic fN decoder until zlog-confirmed.
+    16403: [(1, "mode", "int")],                             # ReqSwitchShootingMode
+    16404: [(3, "client_param", ("msg", "client_params"))],  # ReqEnterCamera
+    16405: [],                                               # ReqGetDeviceStateInfo
+
+    # ── VOICE_ASSISTANT (module 16, single dispatcher 16800) — added 2026-07-31.
+    # Confirmed structurally (not per-field zlog) from dwarf3-tracking-protocol memory:
+    # "a single generic CMD_VOICE_ASSISTANT_TASK=16800 handler with an internal
+    # switch(task_type) on a protobuf field — all 26+ voice-assistant actions live
+    # behind this one command id". Only the simpler param sub-messages are modeled
+    # here (move/goto/track/focus/sentry/calibration/panorama); the larger ones
+    # (astro/record/timelapse/burst/schedule params) are deliberately left off the
+    # schema so they fall through to the generic fN decoder rather than silently
+    # dropping data behind an incomplete nested-schema entry.
+    16800: [(1, "command_type", _VOICE_CMD_TYPE), (2, "shooting_mode", "int"),
+            (16, "move_params", ("msg", "voice_move_params")),
+            (17, "goto_params", ("msg", "voice_goto_params")),
+            (18, "calibration_params", ("msg", "voice_calibration_params")),
+            (19, "focus_params", ("msg", "voice_focus_params")),
+            (20, "track_params", ("msg", "voice_track_params")),
+            (23, "panorama_params", ("msg", "voice_panorama_params"))],
 
     # ── notifies / acks (device -> phone) ───────────────────────────────────────
     # CAPTURE-VERIFIED 2026-07-23: only ever observed as an ACK (device->phone), echoing

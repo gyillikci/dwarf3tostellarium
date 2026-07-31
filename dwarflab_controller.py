@@ -268,8 +268,60 @@ CMD_GLOBAL_VOICE_ASSISTANT_TASK          = 16406  # NEW in June 2026 APK
 CMD_VOICE_ASSISTANT_TASK                 = 16800  # NEW in June 2026 APK
 
 # ── Device commands (17000-17099) ─────────────────────────────────────────────
+CMD_DEVICE_LENS_DEFOG                    = 17000  # zlog-confirmed (2026-07-31), was missing
 CMD_DEVICE_AUTO_COOLING                  = 17001  # NEW in June 2026 APK
 CMD_DEVICE_AUTO_SHUTDOWN                 = 17002  # NEW in June 2026 APK
+
+# ── Panorama commands (15500-15599) — added 2026-07-31 from firmware Ghidra
+# ack-call scan (ack_calls_parsed.txt) + proto_reconstructed/panorama.proto.
+# IDs marked UNCONFIRMED are gaps in the 295-site bare-ack scan (likely
+# data-returning GET handlers using the other universal sender, FUN_00793398,
+# which the scan didn't cover) — assigned by proto declaration-order inference,
+# same pattern independently confirmed for every ID around them. See
+# dwarf_protobuf.py SCHEMAS for the full per-field payload layout.
+CMD_PANORAMA_START_GRID                  = 15500
+CMD_PANORAMA_STOP                        = 15501
+CMD_PANORAMA_START_BY_EULER_RANGE        = 15502  # UNCONFIRMED id
+CMD_PANORAMA_START_STITCH_UPLOAD         = 15503
+CMD_PANORAMA_STOP_STITCH_UPLOAD          = 15504
+CMD_PANORAMA_GET_CURRENT_UPLOAD_STATE    = 15505  # UNCONFIRMED id
+CMD_PANORAMA_GET_UPLOAD_PREDICT          = 15506  # UNCONFIRMED id
+CMD_PANORAMA_START_COMPRESS              = 15507
+CMD_PANORAMA_STOP_COMPRESS               = 15508
+CMD_PANORAMA_START_FRAMING               = 15509
+CMD_PANORAMA_STOP_FRAMING                = 15510
+CMD_PANORAMA_RESET_FRAMING               = 15511
+CMD_PANORAMA_UPDATE_FRAMING_RECT         = 15512
+CMD_PANORAMA_STOP_FRAMING_AND_START_GRID = 15513
+CMD_NOTIFY_PANORAMA_FRAMING              = 15514  # device -> phone
+
+# ── Shooting Schedule commands (16100-16108) — added 2026-07-31, same sourcing
+# as Panorama above. UNCONFIRMED ids (16102/16103/16106/16107) are proto-order
+# inferred between zlog-confirmed neighbors (16100/16101/16104/16105/16108).
+CMD_SHOOTING_SCHEDULE_SYNC               = 16100
+CMD_SHOOTING_SCHEDULE_CANCEL             = 16101
+CMD_SHOOTING_SCHEDULE_GET_ALL            = 16102  # UNCONFIRMED id
+CMD_SHOOTING_SCHEDULE_GET_BY_ID          = 16103  # UNCONFIRMED id
+CMD_SHOOTING_SCHEDULE_GET_TASK_ID        = 16104
+CMD_SHOOTING_SCHEDULE_REPLACE            = 16105
+CMD_SHOOTING_SCHEDULE_UNLOCK             = 16106  # UNCONFIRMED id
+CMD_SHOOTING_SCHEDULE_LOCK               = 16107  # UNCONFIRMED id
+CMD_SHOOTING_SCHEDULE_DELETE             = 16108
+
+# ── Param commands (16700-16706) — added 2026-07-31. ALL 7 zlog-CONFIRMED
+# (CMD_PARAM_SET_EXPOSURE .. CMD_PARAM_SET_AUTO_PARAMS in ack_calls_parsed.txt).
+# param_id is the 64-bit paramId whose bit 44 selects camera (0=tele/1=wide) —
+# see the "parameter commands DO bake camera identity" finding in
+# dwarf3-tracking-protocol memory; fetch the real per-camera/per-field param_id
+# table from GET http://<device>:8082/getDefaultParamsConfig at runtime rather
+# than hardcoding it here (it may change per firmware build).
+CMD_PARAM_SET_EXPOSURE                   = 16700
+CMD_PARAM_SET_GAIN                       = 16701
+CMD_PARAM_SET_WB                         = 16702
+CMD_PARAM_SET_GENERAL_INT_PARAM          = 16703
+CMD_PARAM_SET_GENERAL_FLOAT_PARAM        = 16704
+CMD_PARAM_SET_GENERAL_BOOL_PARAM         = 16705
+CMD_PARAM_SET_AUTO_PARAMS                = 16706
 
 # ── Proto3 primitives ─────────────────────────────────────────────────────────
 def _varint(v):
@@ -288,6 +340,7 @@ def _field(fn, wt, val):
     if wt == 2:
         if isinstance(val, str): val = val.encode()
         return tag + _varint(len(val)) + val
+    if wt == 5: return tag + struct.pack("<f", val)  # float32 (proto3 `float`)
     raise ValueError(f"bad wt {wt}")
 
 def _dvarint(buf, pos):
@@ -1095,6 +1148,239 @@ class DwarfLab:
     def set_auto_shutdown(self, enabled=True):
         """CMD_DEVICE_AUTO_SHUTDOWN (17002) — toggle auto shutdown."""
         self.send(CMD_DEVICE_AUTO_SHUTDOWN, p_int(1 if enabled else 0))
+
+    def set_lens_defog(self, enabled=True):
+        """CMD_DEVICE_LENS_DEFOG (17000) — toggle the lens heater/defog element."""
+        self.send(CMD_DEVICE_LENS_DEFOG, p_int(1 if enabled else 0))
+
+    # ── Panorama (15500-15599, added 2026-07-31) ──────────────────────────────
+    def panorama_start_grid(self):
+        """CMD_PANORAMA_START_GRID (15500) — start a full-grid panorama sweep."""
+        self.send(CMD_PANORAMA_START_GRID)
+
+    def panorama_stop(self):
+        """CMD_PANORAMA_STOP (15501)."""
+        self.send(CMD_PANORAMA_STOP)
+
+    def panorama_start_stitch_upload(self, resource_id, user_id, ak, sk, token,
+                                      bucket, bucket_prefix, panorama_name="",
+                                      app_platform=0, from_="", env_type=""):
+        """CMD_PANORAMA_START_STITCH_UPLOAD (15503) — hand the device short-lived
+        cloud (S3/COS) credentials so it can upload the stitched panorama itself.
+        Field layout schema-exact from panorama.proto; ak/sk/token are the same
+        kind of short-lived STS credential noted in dwarf3-emmc-root-access
+        memory ("Cloud/AWS/COS credentials ... short-lived STS tokens fetched at
+        runtime") — do not hardcode long-lived keys here."""
+        data = (_field(1, 0, resource_id) + _field(2, 2, user_id) +
+                _field(3, 0, app_platform) + _field(4, 2, panorama_name) +
+                _field(5, 2, ak) + _field(6, 2, sk) + _field(7, 2, token) +
+                _field(8, 2, bucket) + _field(9, 2, bucket_prefix) +
+                _field(10, 2, from_) + _field(11, 2, env_type))
+        self.send(CMD_PANORAMA_START_STITCH_UPLOAD, data)
+
+    def panorama_stop_stitch_upload(self, user_id=""):
+        """CMD_PANORAMA_STOP_STITCH_UPLOAD (15504)."""
+        self.send(CMD_PANORAMA_STOP_STITCH_UPLOAD, _field(1, 2, user_id))
+
+    def panorama_compress(self, panorama_name):
+        """CMD_PANORAMA_START_COMPRESS (15507)."""
+        self.send(CMD_PANORAMA_START_COMPRESS, _field(1, 2, panorama_name))
+
+    def panorama_stop_compress(self):
+        """CMD_PANORAMA_STOP_COMPRESS (15508)."""
+        self.send(CMD_PANORAMA_STOP_COMPRESS)
+
+    def panorama_start_framing(self):
+        """CMD_PANORAMA_START_FRAMING (15509) — interactive framing-rect mode."""
+        self.send(CMD_PANORAMA_START_FRAMING)
+
+    def panorama_stop_framing(self):
+        """CMD_PANORAMA_STOP_FRAMING (15510)."""
+        self.send(CMD_PANORAMA_STOP_FRAMING)
+
+    def panorama_reset_framing(self):
+        """CMD_PANORAMA_RESET_FRAMING (15511)."""
+        self.send(CMD_PANORAMA_RESET_FRAMING)
+
+    def panorama_update_framing_rect(self, x_tl, y_tl, x_br, y_br):
+        """CMD_PANORAMA_UPDATE_FRAMING_RECT (15512) — normalized [0,1] rect corners."""
+        data = (_field(1, 1, x_tl) + _field(2, 1, y_tl) +
+                _field(3, 1, x_br) + _field(4, 1, y_br))
+        self.send(CMD_PANORAMA_UPDATE_FRAMING_RECT, data)
+
+    def panorama_stop_framing_and_start_grid(self):
+        """CMD_PANORAMA_STOP_FRAMING_AND_START_GRID (15513)."""
+        self.send(CMD_PANORAMA_STOP_FRAMING_AND_START_GRID)
+
+    # ── Shooting Schedule (16100-16108, added 2026-07-31) ─────────────────────
+    # NOTE: sync/replace take a full ShootingScheduleMsg (18 fields, see
+    # dwarf_protobuf.py NESTED_SCHEMAS["shooting_schedule_msg"]) — building one by
+    # hand from these low-level primitives is exposed here (_shooting_schedule_msg)
+    # rather than wrapped in a single do-everything method, since the real app
+    # likely fills most fields from local schedule-editor UI state this repo has
+    # no equivalent of yet.
+    def _shooting_schedule_msg(self, schedule_id="", schedule_name="", device_id=0,
+                                mac_address="", start_time=0, end_time=0,
+                                password="", schedule_time=0):
+        """Build a (partial) ShootingScheduleMsg — only the fields a caller is
+        likely to set from a scripted client; state/result/sync_state/tasks are
+        left at their proto3 zero-value defaults (server-managed fields)."""
+        return (_field(1, 2, schedule_id) + _field(2, 2, schedule_name) +
+                _field(3, 0, device_id) + _field(4, 2, mac_address) +
+                _field(5, 0, int(start_time)) + _field(6, 0, int(end_time)) +
+                _field(12, 2, password) + _field(17, 0, int(schedule_time)))
+
+    def shooting_schedule_sync(self, **kw):
+        """CMD_SHOOTING_SCHEDULE_SYNC (16100). kwargs -> _shooting_schedule_msg()."""
+        self.send(CMD_SHOOTING_SCHEDULE_SYNC,
+                  _field(1, 2, self._shooting_schedule_msg(**kw)))
+
+    def shooting_schedule_cancel(self, schedule_id, password=""):
+        """CMD_SHOOTING_SCHEDULE_CANCEL (16101)."""
+        self.send(CMD_SHOOTING_SCHEDULE_CANCEL,
+                  _field(1, 2, schedule_id) + _field(2, 2, password))
+
+    def shooting_schedule_get_all(self):
+        """CMD_SHOOTING_SCHEDULE_GET_ALL (16102, UNCONFIRMED id — see CMD constant)."""
+        self.send(CMD_SHOOTING_SCHEDULE_GET_ALL)
+
+    def shooting_schedule_get_by_id(self, schedule_id):
+        """CMD_SHOOTING_SCHEDULE_GET_BY_ID (16103, UNCONFIRMED id)."""
+        self.send(CMD_SHOOTING_SCHEDULE_GET_BY_ID, _field(1, 2, schedule_id))
+
+    def shooting_schedule_get_task_by_id(self, task_id):
+        """CMD_SHOOTING_SCHEDULE_GET_TASK_ID (16104) — zlog-confirmed."""
+        self.send(CMD_SHOOTING_SCHEDULE_GET_TASK_ID, _field(1, 2, task_id))
+
+    def shooting_schedule_replace(self, **kw):
+        """CMD_SHOOTING_SCHEDULE_REPLACE (16105). kwargs -> _shooting_schedule_msg()."""
+        self.send(CMD_SHOOTING_SCHEDULE_REPLACE,
+                  _field(1, 2, self._shooting_schedule_msg(**kw)))
+
+    def shooting_schedule_unlock(self, schedule_id, password):
+        """CMD_SHOOTING_SCHEDULE_UNLOCK (16106, UNCONFIRMED id)."""
+        self.send(CMD_SHOOTING_SCHEDULE_UNLOCK,
+                  _field(1, 2, schedule_id) + _field(2, 2, password))
+
+    def shooting_schedule_lock(self, schedule_id, password):
+        """CMD_SHOOTING_SCHEDULE_LOCK (16107, UNCONFIRMED id)."""
+        self.send(CMD_SHOOTING_SCHEDULE_LOCK,
+                  _field(1, 2, schedule_id) + _field(2, 2, password))
+
+    def shooting_schedule_delete(self, schedule_id, password=""):
+        """CMD_SHOOTING_SCHEDULE_DELETE (16108)."""
+        self.send(CMD_SHOOTING_SCHEDULE_DELETE,
+                  _field(1, 2, schedule_id) + _field(2, 2, password))
+
+    # ── Param (16700-16706, added 2026-07-31) ─────────────────────────────────
+    # param_id is the 64-bit id from GET http://<host>:8082/getDefaultParamsConfig
+    # (bit 44 set = wide camera, clear = tele — see dwarf3-tracking-protocol
+    # memory). Callers should fetch that table at runtime, not hardcode ids.
+    def param_set_exposure(self, param_id, value, mode=0):
+        """CMD_PARAM_SET_EXPOSURE (16700). `mode`: manual(0)/auto — unconfirmed
+        exact enum, mirrors ReqSetExposure{param_id,mode,value}."""
+        data = _field(1, 0, param_id) + _field(2, 0, mode) + _field(3, 0, value)
+        self.send(CMD_PARAM_SET_EXPOSURE, data)
+
+    def param_set_gain(self, param_id, value, mode=0):
+        """CMD_PARAM_SET_GAIN (16701)."""
+        data = _field(1, 0, param_id) + _field(2, 0, mode) + _field(3, 0, value)
+        self.send(CMD_PARAM_SET_GAIN, data)
+
+    def param_set_wb(self, param_id, value, mode=0):
+        """CMD_PARAM_SET_WB (16702) — white balance."""
+        data = _field(1, 0, param_id) + _field(2, 0, mode) + _field(3, 0, value)
+        self.send(CMD_PARAM_SET_WB, data)
+
+    def param_set_int(self, param_id, value):
+        """CMD_PARAM_SET_GENERAL_INT_PARAM (16703) — generic int-valued param."""
+        self.send(CMD_PARAM_SET_GENERAL_INT_PARAM,
+                  _field(1, 0, param_id) + _field(2, 0, value))
+
+    def param_set_float(self, param_id, value):
+        """CMD_PARAM_SET_GENERAL_FLOAT_PARAM (16704) — generic float-valued param."""
+        self.send(CMD_PARAM_SET_GENERAL_FLOAT_PARAM,
+                  _field(1, 0, param_id) + _field(2, 5, value))
+
+    def param_set_bool(self, param_id, value):
+        """CMD_PARAM_SET_GENERAL_BOOL_PARAM (16705) — generic bool-valued param."""
+        self.send(CMD_PARAM_SET_GENERAL_BOOL_PARAM,
+                  _field(1, 0, param_id) + _field(2, 0, 1 if value else 0))
+
+    def param_set_auto(self, camera_type, shooting_tech, is_auto=True):
+        """CMD_PARAM_SET_AUTO_PARAMS (16706) — {camera_type, shooting_tech, is_auto}."""
+        data = (_field(1, 0, camera_type) + _field(2, 0, shooting_tech) +
+                _field(3, 0, 1 if is_auto else 0))
+        self.send(CMD_PARAM_SET_AUTO_PARAMS, data)
+
+    # ── Voice Assistant (single dispatcher 16800, added 2026-07-31) ───────────
+    # Firmware runs every voice action through this ONE command id with an
+    # internal switch on `command_type` (see dwarf3-tracking-protocol memory,
+    # "Voice Assistant module clarified"). Exposed as one low-level builder plus
+    # thin convenience wrappers for the parameter-free actions; the
+    # parameterized ones (move/goto/focus/track/calibration/panorama) take a
+    # pre-built nested-message blob — build with `_field`/`_field`-of-`_field`,
+    # matching dwarf_protobuf.py's NESTED_SCHEMAS shapes for each param message.
+    VOICE_CMD_GET_STATUS = 1; VOICE_CMD_TAKE_PHOTO = 2
+    VOICE_CMD_START_RECORD = 3; VOICE_CMD_STOP_RECORD = 4
+    VOICE_CMD_START_TIMELAPSE = 5; VOICE_CMD_STOP_TIMELAPSE = 6
+    VOICE_CMD_START_BURST = 7; VOICE_CMD_STOP_BURST = 8
+    VOICE_CMD_START_ASTRO = 9; VOICE_CMD_STOP_ASTRO = 10
+    VOICE_CMD_START_SENTRY = 11; VOICE_CMD_STOP_SENTRY = 12
+    VOICE_CMD_MOVE = 13; VOICE_CMD_GOTO_TARGET = 14; VOICE_CMD_STOP_GOTO = 15
+    VOICE_CMD_CALIBRATION = 16; VOICE_CMD_STOP_CALIBRATION = 17
+    VOICE_CMD_AUTO_FOCUS = 18; VOICE_CMD_STOP_FOCUS = 19; VOICE_CMD_STOP_ALL = 20
+    VOICE_CMD_START_TRACK = 21; VOICE_CMD_STOP_TRACK = 22
+    VOICE_CMD_ADD_SCHEDULE = 23; VOICE_CMD_CANCEL_SCHEDULE = 24
+    VOICE_CMD_END_CONVERSATION = 25
+    VOICE_CMD_START_PANORAMA = 26; VOICE_CMD_STOP_PANORAMA = 27
+
+    def voice_command(self, command_type, shooting_mode=None, param_field=None,
+                       param_bytes=b""):
+        """Low-level ReqVoiceCommand builder. `param_field`/`param_bytes`: the
+        proto field number (10-23, see voice_assistant.proto) + pre-encoded
+        nested-message bytes for command types that need one (MOVE=16,
+        GOTO_TARGET=17, CALIBRATION=18, AUTO_FOCUS=19, START_TRACK=20,
+        START_PANORAMA=23 — matching dwarf_protobuf.py's NESTED_SCHEMAS)."""
+        data = _field(1, 0, command_type)
+        if shooting_mode is not None:
+            data += _field(2, 0, shooting_mode)
+        if param_field is not None and param_bytes:
+            data += _field(param_field, 2, param_bytes)
+        self.send(CMD_VOICE_ASSISTANT_TASK, data)
+
+    def voice_get_status(self):        self.voice_command(self.VOICE_CMD_GET_STATUS)
+    def voice_take_photo(self):        self.voice_command(self.VOICE_CMD_TAKE_PHOTO)
+    def voice_start_record(self):      self.voice_command(self.VOICE_CMD_START_RECORD)
+    def voice_stop_record(self):       self.voice_command(self.VOICE_CMD_STOP_RECORD)
+    def voice_start_astro(self):       self.voice_command(self.VOICE_CMD_START_ASTRO)
+    def voice_stop_astro(self):        self.voice_command(self.VOICE_CMD_STOP_ASTRO)
+    def voice_start_sentry(self):      self.voice_command(self.VOICE_CMD_START_SENTRY)
+    def voice_stop_sentry(self):       self.voice_command(self.VOICE_CMD_STOP_SENTRY)
+    def voice_stop_goto(self):         self.voice_command(self.VOICE_CMD_STOP_GOTO)
+    def voice_stop_calibration(self):  self.voice_command(self.VOICE_CMD_STOP_CALIBRATION)
+    def voice_auto_focus(self):        self.voice_command(self.VOICE_CMD_AUTO_FOCUS)
+    def voice_stop_focus(self):        self.voice_command(self.VOICE_CMD_STOP_FOCUS)
+    def voice_stop_all(self):          self.voice_command(self.VOICE_CMD_STOP_ALL)
+    def voice_start_track(self):       self.voice_command(self.VOICE_CMD_START_TRACK)
+    def voice_stop_track(self):        self.voice_command(self.VOICE_CMD_STOP_TRACK)
+    def voice_end_conversation(self):  self.voice_command(self.VOICE_CMD_END_CONVERSATION)
+    def voice_stop_panorama(self):     self.voice_command(self.VOICE_CMD_STOP_PANORAMA)
+
+    def voice_move(self, azimuth_deg, altitude_deg, speed=1):
+        """VOICE_CMD_MOVE (13) with a nested VoiceMoveParams at field 16."""
+        p = _field(1, 1, azimuth_deg) + _field(2, 1, altitude_deg) + _field(3, 0, speed)
+        self.voice_command(self.VOICE_CMD_MOVE, param_field=16, param_bytes=p)
+
+    def voice_calibration(self, lon, lat):
+        """VOICE_CMD_CALIBRATION (16) with a nested VoiceCalibrationParams at field 18."""
+        p = _field(1, 1, lon) + _field(2, 1, lat)
+        self.voice_command(self.VOICE_CMD_CALIBRATION, param_field=18, param_bytes=p)
+
+    def voice_start_panorama(self, rows=1, columns=1):
+        """VOICE_CMD_START_PANORAMA (26) with a nested VoicePanoramaParams at field 23."""
+        p = _field(1, 0, rows) + _field(2, 0, columns)
+        self.voice_command(self.VOICE_CMD_START_PANORAMA, param_field=23, param_bytes=p)
 
     # ── System controls ───────────────────────────────────────────────────────
     def set_location(self, lat, lon, alt=0):
